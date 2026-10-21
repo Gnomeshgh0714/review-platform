@@ -1,0 +1,1499 @@
+[
+ {
+  "dimension": "security",
+  "findings": [
+   {
+    "description": "UserViewSet 是 ModelViewSet，但整个视图集只有 login 放行匿名、create 内部校验 is_editor（views.py:27-33），get_permissions 对其余动作一律只返回 IsAuthenticated（views.py:16-20）。DRF 默认路由因此暴露 GET /api/users/、GET/PUT/PATCH/DELETE /api/users/{user_id}/ 给任何登录用户。触发条件：任一低权限账号（如演示作者账号）携带自己的 JWT 调用上述接口。后果：(1) GET /api/users/ 可枚举全部用户（含邮箱、机构、研究方向）；(2) PUT /api/users/{pk}/ 传入 {\"password\":\"xxx\",\"roles\":[\"EDITOR\"]} 可重置任意账号（含编辑部账号）的密码并登录，实现完整账号接管；(3) DELETE /api/users/{pk}/ 可删除任意用户。tests.py:95 记录了 create 曾为 AllowAny 的修复回归，但 update/destroy/list 仍处于同等暴露状态且无测试覆盖。",
+    "evidence": "views.py:16-20 `if self.action == 'login': return [AllowAny()]; return [IsAuthenticated()]`；line 13 `queryset = User.objects.all()`；create() 内 `if not request.user.is_editor: return 403`，list/retrieve/update/partial_update/destroy 无任何重写；tests.py:95 注释\"此前 create 为 AllowAny，未登录也可自建 EDITOR 账号\"。",
+    "file": "dev/backend/apps/users/views.py",
+    "line": 16,
+    "severity": "致命",
+    "title": "UserViewSet 默认 CRUD 动作无角色校验，任意登录用户可重置任意账号密码并接管编辑部账号",
+    "valid": true,
+    "verdict_reason": "证据属实。apps/users/views.py:16-20 get_permissions 仅对 login 返回 AllowAny，其余动作一律 IsAuthenticated；create()（27-37行）内部有 is_editor 校验，但 list/retrieve/update/partial_update/destroy 全部沿用 ModelViewSet 默认实现（全文件确认无任何重写）。users/urls.py:5-6 用 DefaultRouter 注册，标准路由 GET/PUT/PATCH/DELETE /api/users/{user_id}/ 全部暴露。UserSerializer.update（serializers.py:26-33）pop password 后 set_password，其余字段（含 roles）直接 setattr——PATCH /api/users/{编辑部user_id}/ {\"password\":\"xxx\"} 即可重置任意账号密码完成接管；GET /api/users/ 经 UserSerializer 返回 email/institution/research_areas。tests.py:95 注释（\"此前 create 为 AllowAny…\"）也印证仅修过 create 一处。致命定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "update_profile（views.py:74-81）用 UserSerializer(user, data=request.data, partial=True) 直接写当前用户。UserSerializer 的 Meta.fields 包含 'roles' 且未列入 read_only_fields（serializers.py:11-13），update() 对 validated_data 逐项 setattr（serializers.py:26-33），roles 是无约束 JSONField。触发条件：任一登录用户 PUT /api/users/update_profile/ 提交 {\"roles\":[\"EDITOR\"]}。后果：普通审稿人/作者可把自己提升为 EDITOR，获得全部编辑部能力（创建任务、分配审稿人、看板、终审决策、知识库导出等），且登录响应和 /api/users/me/ 会把新角色返回给前端。同一序列化器还允许改 email（登录标识）且改密码不校验旧密码，会话被劫持后攻击者可直接改密锁定账号。",
+    "evidence": "serializers.py:11-12 `fields = ['user_id', 'name', 'email', 'roles', ...]`，read_only_fields 仅 ['user_id','created_at','updated_at']；serializers.py:28-29 `for attr, value in validated_data.items(): setattr(instance, attr, value)`；views.py:78 `serializer = UserSerializer(user, data=request.data, partial=True)`。",
+    "file": "dev/backend/apps/users/serializers.py",
+    "line": 11,
+    "severity": "致命",
+    "title": "UserSerializer 的 roles 为可写字段，任意用户可经 update_profile 自报角色提权为 EDITOR",
+    "valid": true,
+    "verdict_reason": "证据属实。serializers.py:11-13 fields 含 'roles'，read_only_fields 仅 ['user_id','created_at','updated_at']；update()（26-33行）对 validated_data 逐项 setattr。views.py:74-81 update_profile 用 UserSerializer(user, data=request.data, partial=True) 直接写当前用户。roles 为无约束 JSONField（users/models.py:17），PUT /api/users/update_profile/ {\"roles\":[\"EDITOR\"]} 即可提权为编辑部（is_editor 属性仅检查 'EDITOR' in roles，models.py:43-45），获得创建任务/分配/终审/导出等全部能力。email 同样可写、改密无旧密码校验。独立于问题0的另一条完整提权路径，致命定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "task_opinions（views.py:609-679）按 query 参数 task_id 取任意任务：编辑部分支可见全部；作者分支（views.py:653-665）只校验任务状态为 SUMMARIZED/DECIDED 且 publish_opinions_to_author 为真，随后即返回该任务全部 SUBMITTED 意见，但没有校验 task.author_user_id == user。触发条件：作者 A 登录后请求 GET /api/opinions/task_opinions/?task_id=<作者B的任务ID>，只要 B 的任务已汇总/已决策且设置了向作者公开，即成功。后果：任意作者可读取平台上所有其他作者稿件的完整审稿意见（各维度评语、综合评语、修改建议、推荐结论），违反 PRD「审稿意见展示-作者：作者（经发布后）」的归属语义与 AC-F-12。对比同文件 get_form 的作者分支（views.py:107-112）明确做了 `if task.author_user_id != user: 403`，此处为遗漏。",
+    "evidence": "views.py:653-668 `elif user.is_author: if task.status not in ['SUMMARIZED','DECIDED']: ... if not task.publish_opinions_to_author: ...`（无归属校验即返回意见）；对照 views.py:108-111 `if task.author_user_id != user: return Response({'error': '无权访问此任务表单'}, status=403)`。",
+    "file": "dev/backend/apps/forms/views.py",
+    "line": 653,
+    "severity": "严重",
+    "title": "task_opinions 作者分支缺少任务归属校验，任意作者可读取其他作者任务的全部审稿意见（IDOR）",
+    "valid": true,
+    "verdict_reason": "证据属实。forms/views.py:653-673 作者分支仅校验 task.status in ['SUMMARIZED','DECIDED'] 与 task.publish_opinions_to_author，随后直接返回该任务全部 SUBMITTED 意见（anonymize_opinion 仅移除审稿人身份、保留全部意见内容，见 forms/services.py:183-203），全程无 task.author_user_id == user 校验。对照同文件 get_form 作者分支 107-112 行明确有 `if task.author_user_id != user: 403`，确系遗漏。publish_opinions_to_author 模型默认 True、make_decision 的 publish 默认 True，已汇总/已决策任务常态满足条件，任意作者可跨作者读取完整审稿意见，违反 PRD AC-F-12（PRD 795行）。严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "FileService.get_file_path（services.py:132-157）查到 UploadedFile 后直接返回磁盘路径，唯一的\"鉴权\"是登录，代码注释自认\"当前策略：登录即可下载\"。download 动作（views.py:100-141）据此把任意 file_id 的文件流式返回；file_id 是连续自增 BigAutoField，可直接遍历。check_metadata（views.py:146-187）则连这一层都没有，直接按 pk 取记录返回。技术实施方案 §1.5 明确要求\"文件下载需鉴权，通过后端API中转（非直接暴露文件路径），按角色验证下载权限\"，实现不满足。触发条件：任一登录用户（如演示作者账号）GET /api/files/1/download/、/api/files/2/download/… 或 /api/files/{id}/check_metadata/。后果：可下载所有作者未公开的稿件全文（学术成果泄露），并可经 check_metadata 读取他人稿件的 pdf_metadata_author（作者真实姓名）与匿名化检查结果。delete_file 反而做了上传人/编辑部校验（services.py:260-265），说明细粒度校验在该模块是有意为之但未覆盖读路径。",
+    "evidence": "services.py:154-157 注释 `# 鉴权：已登录用户均可下载（审稿人需查看稿件）... 当前策略：登录即可下载`；views.py:161 `UploadedFile.objects.get(file_id=pk)` 后无任何归属/角色判断；技术实施方案 §1.5 访问控制行：\"按角色验证下载权限\"。",
+    "file": "dev/backend/apps/files/services.py",
+    "line": 154,
+    "severity": "严重",
+    "title": "文件下载与元数据接口无对象级权限：任意登录用户可枚举下载全部稿件 PDF",
+    "valid": true,
+    "verdict_reason": "证据属实。files/services.py:154-157 注释自认 \"当前策略：登录即可下载\"，get_file_path 查到记录即返回磁盘路径，无任何归属/角色判断；views.py:100-141 download 据此流式返回任意 file_id 文件；views.py:160-187 check_metadata 直接按 pk 取记录返回 pdf_metadata_author 与匿名化检查结果，连登录用户归属校验都没有；file_id 为 BigAutoField 连续可遍历。对照 delete_file（services.py:260-265）有上传人/编辑部校验，证明读路径系遗漏而非设计。技术实施方案 §1.5（prd/V1.1_审稿协作平台_技术实施方案.md:83）明确要求 \"按角色验证下载权限\"，实现不符。该事项不在决策日志 #011 与 dev/README.md 已知限制备案内。任意登录用户可下载全部未公开稿件全文，严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskSerializer 无条件输出 author_name、author_email（serializers.py:35-36，字段表第46行），并嵌套 ReviewAssignmentSerializer（serializers.py:39），后者输出 reviewer_name、reviewer_email（serializers.py:17-18, 24-28）。该序列化器用于 GET /api/tasks/{id}/（retrieve）、my_articles（作者侧）、以及 make_decision 响应，全程不区分调用者角色，也不看 review_mode。触发条件：(1) 被分配的审稿人 GET 双盲任务的详情 → 直接看到作者姓名与邮箱；(2) 作者 GET my_articles 或任务详情 → 在 assignments 数组里看到全部审稿人姓名与邮箱。后果：无论单盲还是双盲，作者身份与审稿人身份对彼此完全透明，双盲保护完全失效；PRD AC-T-13 明确要求\"双盲模式下，审稿人不可见作者信息，作者不可见审稿人身份\"，属验收标准中的安全测试项。",
+    "evidence": "serializers.py:35-36 `author_name = serializers.CharField(source='author_user_id.name'...)` / `author_email = ...source='author_user_id.email'...`；serializers.py:17-18 `reviewer_name/reviewer_email`；views.py my_articles(303-316) 与 retrieve 均直接序列化，无 review_mode 分支；PRD AC-T-13：\"双盲保护 | 双盲模式下，审稿人不可见作者信息，作者不可见审稿人身份…| 安全测试\"。",
+    "file": "dev/backend/apps/tasks/serializers.py",
+    "line": 36,
+    "severity": "严重",
+    "title": "任务序列化器破坏双盲：向被分配审稿人暴露作者姓名/邮箱，向作者暴露全部审稿人姓名/邮箱",
+    "valid": true,
+    "verdict_reason": "证据属实。tasks/serializers.py:35-36 无条件输出 author_name/author_email（source='author_user_id.name/email'），:39 嵌套 ReviewAssignmentSerializer，后者 :17-18 输出 reviewer_name/reviewer_email。该序列化器用于 retrieve（Reviewer 可经 get_queryset 中的被分配任务命中详情）、my_articles（views.py:302-316）与 make_decision 响应，全程无 review_mode 分支。审稿人 GET 双盲任务详情即见作者姓名邮箱；作者经 my_articles/详情即在 assignments 数组看到全部审稿人姓名邮箱。PRD AC-T-13（PRD_P0功能_V1.1:512）原文核实：\"双盲模式下，审稿人不可见作者信息，作者不可见审稿人身份…安全测试\"。双盲保护在 API 层完全失效，严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskViewSet 只重写了 create（编辑部校验，views.py:38-41）和各自定义 action；update/partial_update/destroy 沿用 ModelViewSet 默认实现，权限仅剩全局 IsAuthenticated，可见性由 get_queryset 决定（作者可见自己的任务、审稿人可见被分配的任务）。ReviewTaskSerializer 的 read_only_fields 只保护了 status/final_decision/decision_notes 等少数字段（serializers.py:51-52），manuscript_file、author_user_id、publish_opinions_to_author、deadline、template_id、created_by 均可写。触发条件：作者 PATCH /api/tasks/{自己的任务}/ 或被分配审稿人 PATCH /api/tasks/{该任务}/，传入 {\"manuscript_file\":\"uploads/...另一文件.pdf\"}、{\"publish_opinions_to_author\":true} 或任意 deadline；或直接 DELETE /api/tasks/{id}/。后果：作者可在审稿进行中偷换稿件内容（评审对象被篡改）、自行公开审稿意见；任何关联人可删除任务并级联删除 assignments、ReviewOpinion、StateLog、Notification，销毁全部审稿证据。",
+    "evidence": "views.py:16-57 仅 create 有 `if not request.user.is_editor: return 403`，无 update/destroy/get_permissions 重写；serializers.py:51-52 read_only_fields 未含 manuscript_file/author_user_id/publish_opinions_to_author/deadline/created_by；模型 on_delete=CASCADE（models.py:78-81, 41-44）。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 16,
+    "severity": "严重",
+    "title": "ReviewTaskViewSet 的 update/partial_update/destroy 无角色校验，作者/审稿人可篡改或删除审稿任务",
+    "valid": true,
+    "verdict_reason": "证据属实。tasks/views.py:16-57 ReviewTaskViewSet 为 ModelViewSet，无 permission_classes/get_permissions，仅剩全局 IsAuthenticated（settings.py:135-137），仅 create（38-41行）有 is_editor 校验；update/partial_update/destroy 无任何重写。serializers.py:51-52 read_only_fields 仅 ['task_id','status','final_decision','decision_notes','retry_count','version','created_at','updated_at']，manuscript_file/author_user_id/publish_opinions_to_author/deadline/template_id/created_by/review_mode 均可写。作者（get_queryset 可见自己的任务）可 PATCH 偷换 manuscript_file、自行开启 publish_opinions_to_author；被分配审稿人同样可改其可见任务；DELETE 级联删除 assignments（tasks/models.py:78-81 CASCADE）、ReviewOpinion（forms/models.py:41 CASCADE）、ReviewForm、StateLog、Notification、SummaryReport，销毁全部审稿证据。严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "TemplateViewSet 在 create（views.py:340-346）和 toggle_status（views.py:348-356）里做了 is_editor 校验，但 PUT/PATCH/DELETE /api/templates/{id}/ 未做任何校验。TemplateSerializer 除 template_id/created_at/updated_at 外全部可写（serializers.py:5-12），含 dimensions（维度配置）、status、template_type、created_by。触发条件：任一作者或审稿人账号 PATCH /api/templates/{系统预设模板ID}/ 修改 dimensions（如把 minWords 改为 0）或 template_name，或 DELETE 该模板。后果：非编辑部用户可篡改或删除包括 SYSTEM_DEFAULT 在内的所有审稿模板，影响后续任务创建与意见校验（FormService.create_form_for_task 冻结的快照来自模板，tasks/services.py:42-61），属越权写操作；模板管理在 PRD 中为编辑部专属（P0 模板功能：创建/编辑/启停/关联使用）。",
+    "evidence": "views.py:327-331 `class TemplateViewSet(viewsets.ModelViewSet)` 仅有 `permission_classes = [IsAuthenticated]`，create/toggle_status 各自检查 is_editor，update/partial_update/destroy 无对应实现；serializers.py:10-12 可写字段含 dimensions/status/created_by。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 327,
+    "severity": "严重",
+    "title": "TemplateViewSet 的 update/destroy 缺少编辑部校验，任意登录用户可篡改/删除审稿模板",
+    "valid": true,
+    "verdict_reason": "证据属实。tasks/views.py:327-331 TemplateViewSet(ModelViewSet) 仅 permission_classes=[IsAuthenticated]；create（340-346行）与 toggle_status（348-356行）各查 is_editor，update/partial_update/destroy 无对应实现。TemplateSerializer（serializers.py:5-12）read_only_fields 仅 ['template_id','created_at','updated_at']，dimensions/status/template_type/template_name/created_by 全部可写。任一作者/审稿人可 PATCH /api/templates/{id}/（含 SYSTEM_DEFAULT 模板，init_default_templates 创建时 status='ACTIVE'，在默认 get_queryset 可见范围内）篡改 dimensions 或 DELETE。PRD 知识库权限矩阵（1296行）规定模板 \"创建/编辑/启停\" 为编辑部专属、审稿人仅查看。属越权写操作，严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "knowledge/detail 接口允许审稿人访问（views.py:94-97），KnowledgeService.get_detail 对审稿人仅限制\"必须是 APPROVED 状态\"（services.py:527-529），随后返回 KnowledgeItemSerializer(item).data（services.py:539-540）。该序列化器的 fields 含 source_task_id（溯源到原审稿任务，serializers.py:32）、pending_review_segments（待人工审核的身份线索原文片段，serializers.py:48）、reviewed_by_email（serializers.py:21-23）。触发条件：任一 REVIEWER 角色 GET /api/knowledge/{id}/detail/。后果：审稿人可获知知识库条目对应的原任务编号（source_task_id），若其恰好是被分配过该任务的审稿人即可关联出意见归属；pending_review_segments 本是给编辑部做第二阶段匿名化审核用的身份线索上下文（机构名/指代词等），直接外泄给审稿人，破坏两阶段匿名化。PRD 权限矩阵规定\"查看条目详情：审稿人=匿名化内容\"，US-R-10 要求审稿人\"看不到原作者和原审稿人身份\"；同模块 export_data 明确剔除 source_task_id\"（防止溯源）\"（services.py:554-555），detail 却原样返回。",
+    "evidence": "serializers.py:32 `'source_task_id',`、:48 `'pending_review_segments',` 位于 KnowledgeItemSerializer.fields；services.py:527-529 审稿人分支仅校验 anonymization_status == APPROVED；views.py:100-103 `KnowledgeService.get_detail(knowledge_id, user, ...)`；PRD §知识库权限矩阵：\"查看条目详情 | ✅ 匿名化内容 |（审稿人列）\"。",
+    "file": "dev/backend/apps/knowledge/serializers.py",
+    "line": 32,
+    "severity": "严重",
+    "title": "知识库详情接口向审稿人返回 source_task_id、待审核身份线索片段等非匿名化字段",
+    "valid": true,
+    "verdict_reason": "证据属实。knowledge/views.py:94-97 detail 允许审稿人访问；services.py:527-529 审稿人分支仅限制 anonymization_status==APPROVED；:539-540 直接返回 KnowledgeItemSerializer(item).data。该序列化器 fields（serializers.py:30-54）含 source_task_id（:32）、pending_review_segments（:48）、reviewed_by_email（:21-23）。pending_review_segments 由 _scan_segments 扫描匿名化摘要中 4 类身份线索规则生成（services.py:84, 213-220），系供编辑部第二阶段人工审核的身份线索上下文，直接外泄给审稿人破坏两阶段匿名化。PRD 权限矩阵 1295 行 \"查看条目详情 | ✅ 匿名化内容（审稿人列）\"、US-R-10（1144行）\"看不到原作者和原审稿人身份\" 核实无误；同模块 export_data（services.py:554-577）明确剔除 source_task_id \"防止溯源\"，detail 却原样返回，自相矛盾。严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskViewSet.get_queryset（views.py:19-31）使用 if user.is_editor / elif user.is_reviewer / elif user.is_author 的分支链，没有兜底 else。roles 为空列表（或含任何无法识别的值）的用户三个分支都不命中，queryset 维持 ReviewTask.objects.all()，随后 GET /api/tasks/ 与 GET /api/tasks/{id}/ 返回全部任务（含所有作者的稿件标题、摘要、manuscript_file 路径、assignments 全量）。触发条件：roles=[] 的账号——UserSerializer 的 roles 为无约束 JSONField，用户可经 PUT /api/users/update_profile/ 提交 {\"roles\":[]} 自行制造该状态（配合本报告 users 序列化器问题），编辑部创建用户时传 roles:[] 也会通过（UserCreateSerializer 仅 required=True，空列表仍视为已提供）。后果：鉴权逻辑 fail-open，无角色用户反而获得超出作者/审稿人的最大可见范围。对比同仓库 apps/forms/views.py:58-59 与 apps/forms/views.py:309-310 的同类 get_queryset 均有 `else: qs = qs.none()` 兜底，此处为遗漏。",
+    "evidence": "views.py:23-30 `if user.is_editor: pass; elif user.is_reviewer: qs = qs.filter(assignments__reviewer=user).distinct(); elif user.is_author: qs = qs.filter(author_user_id=user)`（无 else）；对照 forms/views.py:58-59 `else: qs = qs.none()`。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 23,
+    "severity": "严重",
+    "title": "任务可见性过滤缺少兜底分支：roles 为空的用户可见全部任务（fail-open 越权）",
+    "valid": true,
+    "verdict_reason": "证据属实。tasks/views.py:19-31 get_queryset 为 if user.is_editor / elif user.is_reviewer / elif user.is_author 分支链，无兜底 else；roles=[] 的用户三个属性全为 False（users/models.py:43-53 均为 'X' in roles 判断），qs 维持 ReviewTask.objects.all()，GET /api/tasks/ 与 /api/tasks/{id}/ 返回全部任务。该状态可经问题1的 update_profile 提交 {\"roles\":[]} 自行制造，或编辑部建号传 roles:[]（UserCreateSerializer roles 仅 required=True，空列表视为已提供）触发。对照 forms/views.py:58-59 与 309-310 同类 get_queryset 均有 `else: qs = qs.none()` 兜底，确系遗漏。fail-open 鉴权使无角色用户获得最大可见范围，严重定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "SECRET_KEY 取环境变量失败时静默回退到写死在源码里的 'django-insecure-k8$dbc2^z85lqoz1opjbxh4)bfowcq3ov+9^am0mf6j=@0hax_'（settings.py:32）；数据库口令同样有硬编码兜底 'review2026'（settings.py:96）。触发条件：backend/.env 未创建或未写 DJANGO_SECRET_KEY（README 的启动流程并不强制，.env.example 默认值也只是 change-me-in-production）。后果：服务以公开已知的 SECRET_KEY 运行，JWT 签名密钥即告公开——任何读过仓库的人可离线伪造任意用户（含编辑部）的有效 access token 直接通过 JWTAuthentication 认证，等于认证体系整体失效；数据库口令硬编码则让本地 PG 凭据随源码分发。虽然当前为 dev 环境，但该回退没有任何启动告警或失败机制，属于\"代码中的硬编码密钥\"（本维度审查范围明确列出）。",
+    "evidence": "settings.py:32 `SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-k8$dbc2^z85lqoz1opjbxh4)...')`；settings.py:96 `'PASSWORD': os.environ.get('DJANGO_DB_PASSWORD', 'review2026')`；settings.py:143-148 SIMPLE_JWT 使用默认 HS256 签名（由该 SECRET_KEY 派生）。",
+    "file": "dev/backend/review_platform/settings.py",
+    "line": 32,
+    "severity": "一般",
+    "title": "SECRET_KEY 与数据库口令存在源码硬编码兜底值，环境变量缺失时以公开密钥签发 JWT",
+    "valid": true,
+    "verdict_reason": "证据属实。settings.py:32 `SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-k8$dbc2^z85lqoz1opjbxh4)bfowcq3ov+9^am0mf6j=@0hax_')` 逐字符核实一致；:96 DB 口令兜底 'review2026'；SIMPLE_JWT（143-148行）未配 ALGORITHM/SIGNING_KEY，simplejwt 默认 HS256 + 以 Django SECRET_KEY 签名，故回退生效时任何读过仓库者可离线伪造任意用户 access token 通过 JWTAuthentication。dev/README.md:59 启动流程仅 \"cp .env.example .env 按需填写\"，不强制；.env.example 默认值也仅 'change-me-in-production'；回退无任何启动告警。该事项不在 8 项备案内。一般定级恰当（已计入 dev 环境语境）。",
+    "corrected_severity": null
+   },
+   {
+    "description": "SIMPLE_JWT 仅配置了 ACCESS_TOKEN_LIFETIME=12h、REFRESH_TOKEN_LIFETIME=7d 与 USER_ID_FIELD（settings.py:143-148），未配置 ROTATE_REFRESH_TOKENS（simplejwt 默认 False）、未安装 token blacklist 应用，INSTALLED_APPS（settings.py:39-58）中无 rest_framework_simplejwt.token_blacklist。后果：(1) access token 有效期长达 12 小时，一旦泄露（前端将其存于 localStorage，stores/auth.js:31）攻击窗口极大；(2) 不存在任何服务端吊销路径——用户改密（update_profile 可改密）、角色被调整或发现被盗后，已签发 token 在剩余有效期内依然有效，登出操作仅删除前端 localStorage（stores/auth.js:50-56），服务端无感知；(3) refresh token 无轮换，泄露后可无限续期。本维度审查范围明确要求核查\"JWT 有效期与轮换\"。",
+    "evidence": "settings.py:143-148 `SIMPLE_JWT = {'ACCESS_TOKEN_LIFETIME': timedelta(hours=12), 'REFRESH_TOKEN_LIFETIME': timedelta(days=7), ...}`，无 ROTATE_REFRESH_TOKENS/BLACKLIST 配置；INSTALLED_APPS 无 token_blacklist；stores/auth.js:50-56 logout 仅 removeItem。",
+    "file": "dev/backend/review_platform/settings.py",
+    "line": 144,
+    "severity": "一般",
+    "title": "JWT access token 有效期 12 小时且无轮换、无黑名单吊销机制",
+    "valid": true,
+    "verdict_reason": "证据属实。settings.py:143-148 SIMPLE_JWT 仅配 ACCESS_TOKEN_LIFETIME=12h/REFRESH_TOKEN_LIFETIME=7d/USER_ID_FIELD/USER_ID_CLAIM，无 ROTATE_REFRESH_TOKENS（simplejwt 默认 False，已核实 requirements.txt 用 djangorestframework-simplejwt>=5.5）；INSTALLED_APPS（39-58行）仅 'rest_framework_simplejwt' 无 token_blacklist。前端 stores/auth.js:31 将 access token 存 localStorage，:50-56 logout 仅 removeItem，服务端无任何吊销路径——改密/被盗后已签发 token 在剩余 12 小时内仍然有效，refresh token 泄露可无轮换续期 7 天。一般定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "upload_pdf 的格式校验仅做扩展名白名单（services.py:47-50），Content-Type 检查发现异常值时只 logger.warning 不拒绝（services.py:53-56），且未读取文件头魔数判断真实类型。技术实施方案 §1.5 文件限制行明确要求\"PDF格式、≤20MB，上传时即时校验（前端MIME类型+后端文件头校验+大小校验）\"，其中\"后端文件头校验\"未实现。触发条件：任一登录用户上传任意内容（HTML/脚本/二进制）但命名为 *.pdf。后果：服务器成为任意文件存储点（每次最多 20MB、无频率与配额限制，可无限次上传耗尽磁盘）；下载侧虽以 application/pdf + attachment 返回（views.py:137-139）降低了直接渲染风险，但与方案声明的校验行为不符，且后续 PyPDF2/PyMuPDF 解析非 PDF 内容存在不必要的攻击面。",
+    "evidence": "services.py:53-56 `if content_type and content_type not in ALLOWED_CONTENT_TYPES: logger.warning(...)`（无 return/raise）；技术实施方案 §1.5：\"上传时即时校验（前端MIME类型+后端文件头校验+大小校验）\"。",
+    "file": "dev/backend/apps/files/services.py",
+    "line": 53,
+    "severity": "一般",
+    "title": "PDF 上传仅校验扩展名，Content-Type 校验只记日志不拦截，无文件头校验，与技术方案\"后端文件头校验\"要求不符",
+    "valid": true,
+    "verdict_reason": "证据属实。files/services.py:46-50 仅做扩展名白名单（os.path.splitext）；52-56 行 content_type 异常时仅 `logger.warning(f'文件Content-Type异常…')`，无 return/raise，不拦截；全文件无魔数/文件头校验（PDF 头 %PDF- 未检查）。技术实施方案 §1.5（prd/V1.1_审稿协作平台_技术实施方案.md:82）原文核实：\"PDF格式、≤20MB，上传时即时校验（前端MIME类型+后端文件头校验+大小校验）\"，其中后端文件头校验未实现。上传亦无频率/配额限制。命名 *.pdf 的任意内容可入库；下载侧虽以 application/pdf + attachment 返回（views.py:137-139）降低了渲染风险，但与方案声明的校验行为不符且增加 PyPDF2 解析攻击面。一般定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "UserSerializer.create（serializers.py:15-24）与 UserCreateSerializer.create（serializers.py:53-60）在编辑部未显式传密码时，一律 set_password('changeme123')；两处注释/help_text 均声称\"首次登录强制修改\"，但代码库中不存在任何强制改密机制——无 must_change_password 标记、无中间件/拦截、登录接口（views.py:39-67）也无检查。触发条件：编辑部按 PRD §3.1.1 流程创建审稿人/作者账号且未填密码（UserCreateSerializer 的 password 为 required=False），在真实用户首次登录前的时间窗口内，任何知道该邮箱的人都可以用公开的 changeme123 登录该账号。后果：新账号存在身份冒用窗口，审稿人账号被冒用可直接提交/篡改审稿意见。注意与已备案事项#8（bootstrap_dev 演示账号统一默认密码）不同，这是生产建号路径 UserCreateSerializer 中的默认密码逻辑。",
+    "evidence": "serializers.py:21 `user.set_password('changeme123')  # 默认密码，首次登录强制修改`；serializers.py:57 `user.set_password(password or 'changeme123')`；views.py 登录及 UserViewSet 全文无强制改密逻辑；tests.py:75-84 确认默认密码可登录。",
+    "file": "dev/backend/apps/users/serializers.py",
+    "line": 21,
+    "severity": "一般",
+    "title": "编辑部建号默认密码 changeme123，注释声称\"首次登录强制修改\"但平台无任何强制改密实现",
+    "valid": true,
+    "verdict_reason": "证据属实。users/serializers.py:21 `user.set_password('changeme123')  # 默认密码，首次登录强制修改` 与 UserCreateSerializer :57 `user.set_password(password or 'changeme123')` 均核实；全代码库 grep 仅命中这两处注释/help_text，无 must_change_password 字段、无中间件/拦截器、login（views.py:39-67）无任何强制改密检查，注释声称的机制不存在。tests.py:75-84 证实默认密码可直接登录。UserCreateSerializer password 为 required=False，编辑部按 PRD §3.1.1 建号未填密码时即产生冒用窗口。与备案 #8（bootstrap_dev 演示账号 BOOTSTRAP_PASSWORD，另一机制）确属不同代码路径，不构成重复上报。一般定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "CORS_ALLOW_ALL_ORIGINS = True（settings.py:151）允许任意来源的网页读取 API 响应；ALLOWED_HOSTS = ['localhost','127.0.0.1','*']（settings.py:36）中的 '*' 使前两项失效，服务接受任意 Host 头。触发条件：当前端 JWT 经 localStorage 存储时，恶意站点无法自动携带令牌，直接可利用性有限；但任何令牌泄露场景（XSS、日志、浏览器插件）下，任意来源站点可携带该令牌调用全部 API 并读取响应，且任意 Host 头可被用于缓存投毒/密码重置链接伪造类攻击。虽为 dev 环境不苛求生产域名配置，但将白名单写成通配符属于代码内配置选择而非部署约束，本维度审查范围明确列出 CORS 与 ALLOWED_HOSTS。",
+    "evidence": "settings.py:151 `CORS_ALLOW_ALL_ORIGINS = True`；settings.py:36 `ALLOWED_HOSTS = ['localhost', '127.0.0.1', '*']`。",
+    "file": "dev/backend/review_platform/settings.py",
+    "line": 151,
+    "severity": "建议",
+    "title": "CORS 对所有来源开放且 ALLOWED_HOSTS 含通配符 '*'",
+    "serverity": null,
+    "valid": true,
+    "verdict_reason": "证据属实。settings.py:151 `CORS_ALLOW_ALL_ORIGINS = True`、:36 `ALLOWED_HOSTS = ['localhost', '127.0.0.1', '*']` 均核实；Django 语义下列表含 '*' 即接受任意 Host 头，前两项形同虚设。JWT 存 localStorage（stores/auth.js:31）时恶意站点无法自动携带令牌，直接可利用性确实有限（描述本身已如实承认），但令牌泄露场景下任意来源可读取 API 响应，且通配 Host 头可用于缓存投毒/链接伪造。属代码内配置选择而非部署约束。建议定级恰当。",
+    "corrected_severity": null
+   },
+   {
+    "description": "REST_FRAMEWORK 配置（settings.py:131-140）无 DEFAULT_THROTTLE_CLASSES，登录动作 login（views.py:39-67）也无失败计数、延迟或账号锁定逻辑，login 动作本身声明 AllowAny。触发条件：匿名攻击者对 POST /api/users/login/ 高频并发提交邮箱口令字典。后果：可无限速暴力破解口令；结合建号默认密码（changeme123）与演示账号统一密码（已备案#8），实际爆破成功率进一步放大。失败响应统一为\"邮箱或密码错误\"（views.py:56-60）未泄露用户存在性，这一点实现正确。",
+    "evidence": "settings.py:131-140 REST_FRAMEWORK 字典无 throttle 配置；views.py:39-40 `@action(detail=False, methods=['post'], permission_classes=[AllowAny])`，login 体内无任何频率/锁定控制。",
+    "file": "dev/backend/review_platform/settings.py",
+    "line": 131,
+    "severity": "建议",
+    "title": "登录接口无任何限流、验证码或账号锁定机制",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   }
+  ]
+ },
+ {
+  "dimension": "state-concurrency",
+  "findings": [
+   {
+    "description": "位置：views.py make_decision 在事务内先对视图持有的 task 实例赋值 final_decision/decision_notes/publish_opinions_to_author（L235-237），随后调用 execute_transition。但 execute_transition（state_machine.py L91）用 select_for_update().get() 从数据库重新取行得到全新实例，只在新实例上设置 status/version 并 save（L97-99），视图实例上的三个字段从未落库，事务内也没有任何 task.save()。触发条件：任何一次正常的终审决策录入（SUMMARIZED→DECIDED，PRD 核心流程）。后果：数据库中 DECIDED 任务 final_decision=''、decision_notes=''、publish_opinions_to_author 恒为默认值 True；API 响应序列化的是视图内存实例（L245 ReviewTaskSerializer(task)），返回值看似正确，掩盖了丢失。连锁影响：①知识库归档读取 task.final_decision or ''（knowledge/services.py L95），归档决策永远为空；②编辑选择 publish=False 不公开意见的决定被丢弃，forms/views.py task_opinions 以 DB 中的 True 放行，作者总能看到意见；③DECIDED 任务在数据层无任何决策内容。全后端 grep 确认 final_decision 唯一写入点就是这处未保存的赋值。",
+    "evidence": "views.py L234-240: `with transaction.atomic(): task.final_decision = decision; task.decision_notes = notes; task.publish_opinions_to_author = publish; StateMachineService.execute_transition(task, 'DECIDED', ...)`；state_machine.py L91: `task = ReviewTask.objects.select_for_update().get(task_id=task.task_id)`（重新取行，内存修改丢失）",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 235,
+    "severity": "致命",
+    "title": "make_decision 的终审决策字段从未写入数据库，execute_transition 重取行导致全部丢失",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：force_summarize（views.py L190-192）传入 reason='编辑强制提前汇总'；validate_transition 的放行条件是 reason.startswith('强制')（state_machine.py L65），而 '编辑强制提前汇总' 以 '编辑' 开头，startswith('强制')=False，于是「全部已接受审稿人均提交」检查照常执行：accepted 过滤 assignment_status='ACCEPTED'，只要还有一位已接受未提交的审稿人，not_submitted>0 → 抛 StateMachineError。触发条件：任务 REVIEWING、有人已接受但尚未提交（这正是技术方案§2.3.1 第5行「编辑强制提前汇总（≥1份已提交）」的定义场景）。后果：视图无 try/except，DRF 返回 500，编辑完全无法在审稿中途强制汇总；该接口只在无 ACCEPTED 剩余（全员已提交或全员 INVITED/OVERDUE）时才能成功，即恰好在需要它的场景失效。单元测试用 reason='强制汇总'（tests.py L101）恰好转过 startswith 检查，掩盖了与真实调用点的哨兵漂移。handle_overdue action=summarize 的 reason（'部分已提交后…编辑选择强制汇总'）同样不以'强制'开头，存在 ACCEPTED 审稿人时同样 500。",
+    "evidence": "state_machine.py L65: `if not reason.startswith('强制'):`；views.py L191: `StateMachineService.execute_transition(task, 'SUBMITTED', request.user, '编辑强制提前汇总')`；实测 '编辑强制提前汇总'.startswith('强制') == False；tests.py L101 使用 reason='强制汇总' 可通过",
+    "file": "dev/backend/apps/tasks/state_machine.py",
+    "line": 65,
+    "severity": "严重",
+    "title": "force_summarize 在其设计场景下必然 500：reason 前缀哨兵「强制」与实际传参「编辑强制提前汇总」不匹配，未提交校验绕过失效",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：handle_overdue action=summarize（views.py L204-206）与 force_summarize 都能到达 REVIEWING→SUBMITTED；validate_transition 的非放行分支只统计 assignment_status='ACCEPTED' 的记录（state_machine.py L64-66），全部审稿人已被 cron 标为 OVERDUE（或仍是 INVITED）时 accepted 为空集、not_submitted=0，校验通过——「≥1份已提交」这一技术方案§2.3.1 第5/8行的触发条件在代码中任何位置都未被检查。触发条件：任务 REVIEWING、全部审稿人超时且无人提交（cron _mark_overdue 后通知编辑「已提交 0 份」，编辑按通知选择 action=summarize）。后果：任务进入 SUBMITTED 后，generate_report 因无意见抛 ValueError（summaries/services.py L472-473「无已提交的审稿意见，无法生成汇总报告」→ 接口 400）；VALID_TRANSITIONS 中 SUBMITTED 只能去 SUMMARIZED，无 SUBMITTED→PENDING/REVIEWING 回退路径，make_decision 又要求 SUMMARIZED——任务永久卡在 SUBMITTED，只能手工改库，审稿流程死亡。",
+    "evidence": "state_machine.py L64-66: `accepted = task.assignments.filter(assignment_status='ACCEPTED'); not_submitted = accepted.exclude(assignment_status='SUBMITTED').count()`（不检查已提交数≥1，OVERDUE/INVITED 不计入）；summaries/services.py L473: `raise ValueError(f'任务 {task.task_id} 无已提交的审稿意见，无法生成汇总报告')`；VALID_TRANSITIONS（state_machine.py L16-29）无 SUBMITTED 的回退边",
+    "file": "dev/backend/apps/tasks/state_machine.py",
+    "line": 66,
+    "severity": "严重",
+    "title": "0 份意见的任务可被强制汇总转入 SUBMITTED，随后无任何合法出边，任务进入永久死局",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：validate_transition 的 REVIEWING→PENDING 分支（state_machine.py L74-75）。先 `accepted = task.assignments.filter(assignment_status__in=['ACCEPTED','OVERDUE'])`，再 `submitted = accepted.filter(assignment_status='SUBMITTED').count()`——第二个 filter 作用在已限定为 ACCEPTED/OVERDUE 的查询集上，结果恒为 0，因此 L76 的 `if submitted > 0 and not reason.startswith('编辑选择回退')` 守卫永不触发，「已有审稿人提交意见，回退需编辑明确选择」的防线（对应§2.3.1 第7行触发条件）完全失效。同时该分支也不校验「全部已接受审稿人均已超时」这一前置条件。具体竞态触发：process_scheduled._expire_invitations（process_scheduled.py L95-108）先无锁读 status='ASSIGNED' 任务并 prefetch assignments，判断 alive/accepted 均为空后调用 execute_transition；期间某审稿人并发接受邀请（任务已转 REVIEWING），cron 的 execute_transition 重取行后当前状态为 REVIEWING，(REVIEWING,PENDING) 是合法键，恒空的 submitted 守卫放行 → 正在被审稿的任务被系统静默回退为 PENDING，留下 ACCEPTED 分配挂在 PENDING 任务上（其后续提交因任务非 REVIEWING 不会触发任何转换，意见落在 PENDING 任务上）。",
+    "evidence": "state_machine.py L74-75: `accepted = task.assignments.filter(assignment_status__in=['ACCEPTED', 'OVERDUE']); submitted = accepted.filter(assignment_status='SUBMITTED').count()`（对已过滤查询集再过滤 SUBMITTED，恒为空集）；process_scheduled.py L96: `rolled = ReviewTask.objects.filter(status='ASSIGNED').prefetch_related('assignments')`（无锁快照决策回退）",
+    "file": "dev/backend/apps/tasks/state_machine.py",
+    "line": 75,
+    "severity": "严重",
+    "title": "REVIEWING→PENDING 的「已有提交意见需编辑确认」校验恒为空判：在已过滤 ACCEPTED/OVERDUE 的查询集上再过滤 SUBMITTED，submitted 永远等于 0",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：submit（forms/views.py L361-366 状态检查与 L375-382 重复提交检查均在事务外、无锁；L425-427 在事务内盲写 assignment_status）、accept_invitation（views.py L122-132）、reject_invitation（L152-164）、process_scheduled._expire_invitations（L70-77）与 _mark_overdue（L114-146，update_fields 盲写）。技术方案§2.3.2 明确要求提交时对 ReviewAssignment 行加 select_for_update，代码中全库无任何对 assignment 行的锁。触发条件与后果（均为丢失更新/TOCTOU）：①审稿人在截止边界提交，同时 cron _mark_overdue 已把该 assignment 读为 ACCEPTED：提交事务提交后 cron 的盲写落地，assignment 被覆写回 OVERDUE，意见仍 SUBMITTED 而分配记录显示超时，状态互相矛盾；②cron _expire_invitations 与 accept 并发：已接受的审稿人被覆写为 EXPIRED，forms/views.py L362 的状态门禁使其永远无法提交，任务卡在 REVIEWING 且 participants 为 0（check_and_transition_on_submit L134 空集提前返回），只能等编辑手工回退；③同一 assignment 上 accept 与 reject 并发（或双击）：两者都在事务外读到 INVITED，后写者胜，可出现任务已因 accept 转 REVIEWING 而分配记录为 REJECTED 的矛盾；④两位审稿人并发 reject：各自的事务都把对方读作未提交的 INVITED，remaining>0，双双跳过「全部拒绝回退 PENDING」，任务滞留 ASSIGNED 最长到次日 cron 才被 _expire_invitations 补救。",
+    "evidence": "技术方案§2.3.2 伪代码要求 `assignment = ReviewAssignment.objects.select_for_update().get(...)`；forms/views.py L425-427: `assignment.assignment_status = 'SUBMITTED'; assignment.save()`（无锁无版本条件）；process_scheduled.py L145-146: `assignment.assignment_status = 'OVERDUE'; assignment.save(update_fields=['assignment_status'])`（基于先前无锁读取的盲写）；全库 grep select_for_update 仅命中 ReviewTask 三处（state_machine.py L91/L122/L192）",
+    "file": "dev/backend/apps/forms/views.py",
+    "line": 425,
+    "severity": "严重",
+    "title": "assignment 行全生命周期无 select_for_update、无状态条件更新：cron 超时/过期标记与 accept/submit 并发时互相覆写（lost update），违反技术方案§2.3.2 的行锁要求",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：handle_overdue（views.py L196-212）。与 force_summarize 不同，它不检查 task.status，也不校验「其余全部超时」。触发条件A（健康任务被回退）：任务 REVIEWING、仍有 ACCEPTED 且未到期的审稿人在正常工作，编辑直接 POST action=rollback → execute_transition 以 reason '编辑选择回退待分配…'（命中 startswith('编辑选择回退')）通过校验，任务被拉回 PENDING，活跃审稿人的 ACCEPTED 分配保留、仍可向 PENDING 任务提交意见（check_and_transition 因任务非 REVIEWING 不做转换）。触发条件B（500）：任务已因其他路径转为 SUBMITTED（见自动转换抢占条目）或仍为 PENDING 时，被 cron 通知的编辑按提示调用 handle_overdue → (SUBMITTED,PENDING)/(PENDING,PENDING) 均不在 VALID_TRANSITIONS → StateMachineError 未被捕获 → 500。触发条件C：action=summarize 时若仍有 ACCEPTED 审稿人，validate 抛 StateMachineError 同样 500。技术方案§2.3.1 第7/8行把这两条转换限定在「部分提交后其余全部超时」场景，代码未施加该前置条件。",
+    "evidence": "views.py L196-212: handle_overdue 全函数无 task.status 检查、无 assignment 全部到期校验，StateMachineService.handle_all_overdue 调用（L205/L208）无 try/except；对比 force_summarize L187-188 有 `if task.status != 'REVIEWING'` 检查",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 196,
+    "severity": "严重",
+    "title": "handle_overdue 既不校验任务状态也不校验「全部到期」前置条件：健康任务可被回退，且对已转 SUBMITTED 的任务调用必然 500",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：ReviewTaskViewSet 继承 ModelViewSet 且未重写 update/partial_update/destroy，也未声明 permission_classes（review_platform/settings.py L135-137 默认仅 IsAuthenticated）。触发条件：任何已登录用户对其可见任务（get_queryset：作者见自己的、审稿人见分配给自己的）发起 DELETE /api/tasks/{id}/ 或 PATCH。后果：①作者可在 REVIEWING/DECIDED 等任意状态删除自己的任务，级联删除全部 assignments、opinions、StateLog——状态机没有也不可能有对应的合法转换记录，DECIDED 终态任务同样可删，审稿工作量与审计日志一并消失；②PATCH 可修改 publish_opinions_to_author（绕过 make_decision 的公开开关语义）、deadline、manuscript_file、author_user_id 等字段——审稿进行中更换稿件文件或终审后翻转意见公开开关，均不经任何状态校验。status/final_decision 虽为只读，但见下一条「PATCH 盲写回退 status」问题。",
+    "evidence": "views.py L16: `class ReviewTaskViewSet(viewsets.ModelViewSet):`（无 permission_classes、无 update/destroy 重写）；urls.py: `router.register(r'tasks', ReviewTaskViewSet, basename='task')`（PUT/PATCH/DELETE 路由自动生成）；settings.py L135-137: DEFAULT_PERMISSION_CLASSES 仅 IsAuthenticated",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 16,
+    "severity": "严重",
+    "title": "任务视图集沿用 ModelViewSet 默认 update/partial_update/destroy：无角色与状态门禁，任意可见任务可在任意状态（含终态 DECIDED）被 PATCH 改写或 DELETE 级联删除，完全绕过状态机",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：version 字段（models.py L47）只在 execute_transition（state_machine.py L98）与 check_and_transition_on_submit（L142）中自增，全库 grep 无任何按 version 条件更新或比较的代码，技术方案§2.3.2 要求的 update(taskId, version=expected_version) + OptimisticLockError 完全未实现。触发条件：编辑通过默认 PATCH 接口修改任务元数据（该接口用请求开始时 get_object() 取得的实例做全字段 save），与一次状态转换（如 force_summarize 提交 SUBMITTED）并发——PATCH 在转换提交后落盘，把实例上携带的旧 status 一并写回。后果：任务 status 被静默回退（SUBMITTED→REVIEWING），且不产生任何 StateLog，状态字段与状态日志永久不一致，后续基于 status 的全部流程判断失效；两位编辑并发 PATCH 亦为最后写入者通吃，无冲突提示。",
+    "evidence": "grep 全后端 version 仅 4 处：models.py L47 定义、state_machine.py L98/L142 自增、serializers.py L49/L52 只读序列化；无 expected_version / OptimisticLock 任何匹配；技术方案§2.3.2: `rows = ReviewTask.objects.filter(taskId=task_id, version=expected_version).update(...)` 未落地",
+    "file": "dev/backend/apps/tasks/state_machine.py",
+    "line": 98,
+    "severity": "严重",
+    "title": "version 乐观锁字段形同虚设：只自增从不校验，叠加默认 PATCH 端点的全字段盲写，可把并发已提交的状态转换静默回退",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：accept_invitation L138 `if task.status == 'ASSIGNED'`、assign_reviewers L105 `if task.status == 'PENDING' and created`——task 来自事务前的 get_object()，无锁；execute_transition 加锁后重新校验，键 (REVIEWING,REVIEWING)/(ASSIGNED,ASSIGNED) 不在 VALID_TRANSITIONS 中即抛异常，而两处调用均无 try/except。触发条件：两位审稿人几乎同时接受邀请（后到者在先到者提交前已读取 task），或两位编辑同时对同一 PENDING 任务分配审稿人。后果：后到者收到未处理的 500，且其整个事务回滚——接受操作（assignment→ACCEPTED）或新建的分配记录被一并撤销，审稿人/编辑以为操作失败需重试；assign_reviewers 并发选同一审稿人时还会因 unique_together('task','reviewer') 触发 IntegrityError 同样 500。合法的并发操作被当成服务器错误并回滚。",
+    "evidence": "views.py L138: `if task.status == 'ASSIGNED':`（事务外无锁读）；L106-108 在事务内才经 execute_transition 重取行校验；views.py 无 StateMachineError 捕获（对比 forms/views.py L448 有 except StateMachineError）",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 138,
+    "severity": "一般",
+    "title": "accept_invitation/assign_reviewers 对 task.status 的前置判断基于无锁读，并发时后到者触发未捕获的 StateMachineError → 500 且合法操作整体回滚",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：check_and_transition_on_submit 的 participants 过滤（state_machine.py L131-133）排除 OVERDUE。触发条件：两位审稿人截止日期错开（不同批次分配），B 已过截止被 cron 标为 OVERDUE，A 仍在期内并提交。后果：A 提交时 participants 只剩 A（SUBMITTED），not_submitted=0 → 任务自动转 SUBMITTED——这是技术方案§2.3.1 第8行「编辑选择汇总」的结果，但由 SYSTEM 代替编辑做出；第7行「编辑选择回退（已提交意见保留为历史记录）」从此不可达（SUBMITTED 无回退边）。同时 cron 在 B 超时当天已发通知请编辑「三选一」，编辑按通知调用 handle_overdue 时任务已是 SUBMITTED → 未捕获 StateMachineError → 500（与前述 handle_overdue 问题叠加）。PRD C-01 明确该场景由编辑决策，系统自动转换侵占了该决策权。",
+    "evidence": "state_machine.py L131-137: `participants = task.assignments.filter(assignment_status__in=['ACCEPTED', 'REVIEWING', 'SUBMITTED']); ... if not_submitted == 0: task.status = 'SUBMITTED'`（OVERDUE 被排除后，最后一名在期审稿人提交即全员「已提交」）",
+    "file": "dev/backend/apps/tasks/state_machine.py",
+    "line": 132,
+    "severity": "一般",
+    "title": "participants 排除 OVERDUE 后，最后一名在期审稿人提交即自动 REVIEWING→SUBMITTED，抢占 PRD C-01 留给编辑的「回退/汇总」三选一决策",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：forms/views.py submit 的唯一门禁是 L362 的 assignment 状态检查（ACCEPTED/REVIEWING），不检查 task.status；accept_invitation（views.py L126）同样只看 assignment 状态。触发条件：force_summarize 成功执行的场景（剩余审稿人为 INVITED 状态，见前述校验盲区）后，INVITED 审稿人仍可接受邀请（任务已 SUBMITTED/SUMMARIZED/DECIDED，accept 里的 `if task.status=='ASSIGNED'` 为假、无转换），再正常提交意见；或 handle_overdue 过早 rollback 后遗留的 ACCEPTED 审稿人向 PENDING 任务提交。后果：任务已终审（DECIDED）后仍产生新的 SUBMITTED 意见——该意见从未进入汇总报告与决策依据，但 task_opinions 对作者按 status='SUBMITTED' 过滤会把它公开（若 publish 开关为 True），报告与可见意见不一致，审稿闭环语义被破坏。",
+    "evidence": "forms/views.py L361-366: `if assignment.assignment_status not in ['ACCEPTED', 'REVIEWING']: return ...`（无 task.status 检查）；L429-430 check_and_transition_on_submit 对非 REVIEWING 任务静默返回；views.py L102 task_opinions 仅按 `status='SUBMITTED'` 过滤意见",
+    "file": "dev/backend/apps/forms/views.py",
+    "line": 362,
+    "severity": "一般",
+    "title": "submit/accept 只校验 assignment 状态、完全不校验任务状态：任务已 SUBMITTED/SUMMARIZED/DECIDED 后仍可接受遗留邀请并提交新意见",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：assign_reviewers L88-90 对已存在 (task, reviewer) 记录的审稿人直接 continue；模型层 unique_together('task','reviewer')（models.py L105）使任何状态的旧分配（REJECTED/EXPIRED/OVERDUE/SUBMITTED）都永久占用该组合。触发条件：REVIEWING→PENDING 回退（handle_overdue rollback 或全部拒绝）后编辑重新分配，选择了曾参与过该任务的审稿人；若所选审稿人全部有历史记录，created 为空列表。后果：①响应返回「成功分配0位审稿人」而不报错，且 L105 `if task.status == 'PENDING' and created:` 为假 → 不执行 PENDING→ASSIGNED，任务静默停留在待分配，编辑若无细看计数会以为已分配；②N-02 语义的「审稿人级分配次数」attempt_count 字段（models.py L93）在全库无任何自增代码，重新邀请同一审稿人的设计意图无法实现。",
+    "evidence": "views.py L88-90: `if ReviewAssignment.objects.filter(task=task, reviewer=reviewer).exists(): continue`（不区分历史状态，静默跳过）；L105: `if task.status == 'PENDING' and created:`（created 为空则不转换）；models.py L105: `unique_together = [('task', 'reviewer')]`；grep attempt_count 仅模型定义与只读序列化两处",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 89,
+    "severity": "一般",
+    "title": "回退待分配后无法重新邀请任何历史审稿人（unique_together + exists 静默跳过），全选旧审稿人时返回「成功分配0位」且任务不发生 PENDING→ASSIGNED 转换",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：accept_invitation（views.py L126）只检查 assignment_status=='INVITED'，不比较 invitation_expiry 与当天日期；submit（forms/views.py L362）只检查 assignment 状态，不比较 deadline。process_scheduled 为每日 cron（docstring 建议 0 8 * * *）。触发条件：邀请有效期（3天）或审稿截止已过、但下一次 cron 尚未运行的窗口内（最长约24小时），审稿人调用 accept 或 submit。后果：已过期邀请被接受并触发 ASSIGNED→REVIEWING（死邀请复活），已逾期审稿人仍可正常提交并驱动状态机转换——EXPIRED/OVERDUE 的状态语义完全依赖批处理的滞后生效，与字段的文档含义（invitation_expiry「邀请有效期」、deadline「截止日期」）不符，且期间产生的状态与 cron 随后的标记互相竞争（叠加前述无锁覆写问题）。",
+    "evidence": "views.py L126: `if assignment.assignment_status != 'INVITED':`（无 invitation_expiry 日期比较）；forms/views.py L362 同理无 deadline 比较；process_scheduled.py docstring: 「由 cron/launchd 每日调度：0 8 * * *」",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 126,
+    "severity": "一般",
+    "title": "invitation_expiry 与 deadline 均无 API 级校验，过期邀请/逾期提交在每日 cron 运行前的窗口（最长约24小时）内仍被接受并触发状态转换",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：VALID_TRANSITIONS 定义了 (REVIEWING, PENDING) '全部已接受审稿人超时且无可提交意见'（state_machine.py L25，注释标注 C-01/SYSTEM），但全库唯一以 SYSTEM 身份触发它的只有 ASSIGNED→PENDING 的邀请过期回退（process_scheduled.py L100-107）；_mark_overdue 对 REVIEWING 任务只发通知（L148-186，docstring 明言「不做状态机代决」）。触发条件：REVIEWING 任务的全部已接受审稿人被标 OVERDUE 且无任何提交。后果：任务无限期停留在 REVIEWING，直到编辑手动处理；技术方案 R-T-04 缓解措施④「定时任务检查卡住状态的任务」中该自动路径不存在。该偏离仅记录在命令 docstring 中，决策日志 #011 第4条列举的四类降级定时逻辑（邀请过期/截止提醒/超时标记/分配困难上报）并不包含此自动转换的取消，属于未备案的行为缺失。",
+    "evidence": "state_machine.py L25: `('REVIEWING', 'PENDING'): '全部已接受审稿人超时且无可提交意见'`；process_scheduled.py L148-186: 对全部到期的 REVIEWING 任务仅 `NotificationService._notify_multiple(...)` 发通知，无 execute_transition 调用；技术方案§2.3.1 表第6行规定该转换 operator 为 SYSTEM",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 150,
+    "severity": "一般",
+    "title": "转换表第6条（SYSTEM 触发的 REVIEWING→PENDING「全部超时且无可提交意见」）没有任何代码触发点，全部超时任务只能滞留 REVIEWING 等编辑手动处理",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "位置：ReviewOpinion.save 重试循环（forms/models.py L71-81）以 `except IntegrityError: continue` 处理一切完整性错误并按「主键冲突」重新计数重试；但 submit 视图的重复提交防线（existing 查询与 assignment 状态检查，forms/views.py L375-382）在事务外执行，同一审稿人并发双击提交时两者都会通过。触发条件：同一审稿人对同一任务并发发起两次 submit。后果：第二次提交插入意见时命中 OneToOne(assignment) 唯一约束（models.py L43 assignment 为 OneToOneField）而非主键冲突，重试循环误判为主键冲突，重新计数换新主键后仍违反同一约束，空转 6 轮；循环耗尽后落到 L83 的无保存点 save，IntegrityError 直接抛入视图的通用 `except Exception` → 500，本应返回 400「不可重复提交」；FK 违规等其他 IntegrityError 同样被误重试。数据完整性最终由数据库约束兜底（不会产生重复意见），但错误分类与用户反馈错误，且无谓的保存点回滚增加开销。",
+    "evidence": "forms/models.py L76-81: `try: with transaction.atomic(): super().save(...); return; except IntegrityError: continue`（不区分异常来源）；forms/views.py L375-377: `existing = ReviewOpinion.objects.filter(assignment=assignment, round=1, status='SUBMITTED').first()` 位于 transaction.atomic() 之前（L393 才开启事务）",
+    "file": "dev/backend/apps/forms/models.py",
+    "line": 80,
+    "severity": "一般",
+    "title": "ReviewOpinion.save 的编号重试把一切 IntegrityError 当作主键冲突重试，叠加 submit 重复检查位于事务外：同一审稿人并发双击提交空转 6 次重试后以 500 收场",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   }
+  ]
+ },
+ {
+  "dimension": "rule-engine",
+  "findings": [
+   {
+    "description": "SummaryDetail.vue 读取 report.matched_rule/final_recommendation/rule_explanation（43-53行）、report.conflicts（86行）、report.consensus（102行）、report.opinions_summary（114行）、report.dimension_scores（158/191行）、report.distribution（169行）、report.task_number/reviewer_count/created_at（23-25行），但后端 SummaryReportSerializer（dev/backend/apps/summaries/serializers.py:20-36）返回的是 system_recommendation/conflict_points/consensus_points/overall_comments/dimension_comparison/recommendation_distribution/generated_at，两套字段名完全对不上；axios 拦截器（src/api/index.js:23-25）只做 response.data 解包，无任何字段映射。触发条件：编辑部打开任一汇总报告详情页。后果：推荐分布饼图、规则匹配结果、分歧点、一致点、维度对比表、综合评语全部渲染为空，规则引擎输出完全无法到达编辑（AC-S-06 报告完整性实际不成立）。SummaryList.vue 同样全灭：表格读取 task_title/task_number/distribution/matched_rule/final_recommendation/created_at（12-33行），而简要序列化器只有 report_id/task_id/system_recommendation/generated_at；生成对话框选项取 t.id 和 t.task_number（64-66行），任务接口返回的是 task_id（apps/tasks/serializers.py:43），selectedTask 恒为 undefined，summaryApi.generate(undefined) 必然被后端 400 拒绝（apps/summaries/views.py:97-99），从列表页生成报告的流程完全不可用。",
+    "evidence": "前端：`<el-tag v-if=\"report.matched_rule\">`、`report.conflicts`、`report.dimension_scores`、`row.matched_rule`、`:value=\"t.id\"`；后端序列化器 fields=['report_id','task_id','task_title','task_status','opinion_ids','dimension_comparison','recommendation_distribution','conflict_points','consensus_points',...,'system_recommendation','generated_at']；grep 全前端源码无任何文件引用 conflict_points/matchedRuleId/dimension_comparison。",
+    "file": "dev/frontend/src/views/summaries/SummaryDetail.vue",
+    "line": 43,
+    "severity": "致命",
+    "title": "前端汇总报告页面读取的字段与后端序列化器完全不符，规则引擎结果、分歧点、一致点在界面上全部渲染为空",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "技术方案§3.3（N-01 裁决）将 Rule-4 条件A定义为\"小修+大修+拒稿分散，无接收\"、条件B为\"接收+小修+大修分散，无拒稿\"，验证表明确\"接收+小修+大修（无拒稿）→Rule-4（条件B）\"、\"小修+大修+拒稿（无接收）→Rule-4（条件A）\"，§2.3.3 伪代码用 issubset 判断三者存在，均无\"任一类型不得构成多数\"的限定。实现中 cond_a/cond_b 额外要求 minor/major/reject（或 accept/minor/major）全部 < majority_threshold。触发条件：三种类型并存且其中一种达到 ceil(n/2)。后果实例：5人意见为 3接收+1小修+1大修时，实现因 accept=3≥3 使 cond_b 失败落入 Rule-3 返回\"倾向接收但需讨论\"，而技术方案验证表该分布应命中 Rule-4 返回\"分歧需讨论\"；4人 2接收+1小修+1大修、5人 3小修+1大修+1拒稿同样落 Rule-3 而非 Rule-4；4人 1小修+2大修+1拒稿落 Rule-5\"建议大修\"而非 Rule-4。tests.py:45-58 只测了 1/1/1（total=3）这一无多数特例，未覆盖多数落穿情形，偏离被测试掩盖。",
+    "evidence": "services.py:385-392 `cond_a = (accept == 0 and minor > 0 and major > 0 and reject > 0 and minor < majority_threshold and major < majority_threshold and reject < majority_threshold)`；技术方案§3.3 条件表及验证表无多数限定；§2.3.3 Rule4.match 仅 `{MINOR,MAJOR,REJECT}.issubset(rec_set) and ACCEPT not in rec_set`。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 385,
+    "severity": "严重",
+    "title": "Rule-4 实现在 N-01 重定义条件上私自附加\"三种类型均不构成多数\"限制，导致技术方案§3.3验证表所列分布不命中 Rule-4",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD 规则表 Rule-5 触发条件为\"多数（≥半数）推荐大修，无拒稿\"，技术方案§2.3.3 伪代码为 `major_count >= majority and Recommendation.REJECT not in recommendations`。实现 `elif major >= majority_threshold:` 未检查 reject。触发条件：accept=0（否则 Rule-7 先命中）、reject>0 但未达多数（否则 Rule-6 先命中）、major≥多数、且 cond_a 因小修缺席或 major 达多数而不成立。后果实例：5人 3大修+2拒稿，实现返回 Rule-5\"建议大修\"，而按文档 Rule-5 因存在拒稿不成立、Rule-3 因接收+小修=0 不成立，应落入兜底\"无法自动判定，请编辑综合判断\"——存在两张拒稿票的面板被系统直接给出\"建议大修\"结论；4人 1小修+2大修+1拒稿同样错命中 Rule-5（文档应为 Rule-4\"分歧需讨论\"）。",
+    "evidence": "services.py:406-408 `# Rule-5: 多数大修 -> 建议大修  elif major >= majority_threshold:`（无 reject==0 条件）；技术方案§2.3.3 Rule5.match 含 `and Recommendation.REJECT not in recommendations`；PRD §4.3.4 规则表 Rule-5\"多数（≥半数）推荐'大修'，无'拒稿'\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 407,
+    "severity": "严重",
+    "title": "Rule-5 匹配遗漏\"无拒稿\"前置条件，含拒稿异议的多数大修面板被直接给出\"建议大修\"",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §4.3.2 分歧识别规则第4行：\"总体推荐意见出现'接收'与'拒稿'并存 → 🔴 严重分歧，红色高亮+特殊标注'推荐意见对立'+分布信息\"；AC-S-05 验收标准同义；技术方案 T-42 任务拆解也明确包含\"推荐意见对立检测\"。实现 detect_conflicts 仅遍历 dimension_comparison 做维度级 max-min 计算，conflict_points 中不存在任何推荐结论级的分歧条目；接收与拒稿对立仅间接体现在 system_recommendation.matchedRuleId='Rule-7' 的结论文案里，既无\"推荐意见对立\"特殊标注，也不携带分布信息，与 PRD 要求的分歧标注形态（红标+分布）完全不同。触发条件：任何接收与拒稿并存的汇总报告。后果：编辑在分歧点分析中看不到推荐结论对立这一最严重分歧项（AC-S-05 不通过）。",
+    "evidence": "services.py:214 `for dim in dimension_comparison:`（conflict_points 仅由维度分数生成，无推荐分布入参）；后端与前端全库 grep \"对立\" 无命中；PRD §4.3.2 分歧识别规则表第4行、AC-S-05、技术方案 T-42\"推荐意见对立检测\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 199,
+    "severity": "严重",
+    "title": "分歧标注完全缺失\"推荐意见对立\"检测：PRD 分歧识别规则第4行与 AC-S-05、技术方案 T-42 要求的推荐结论级分歧标注未实现",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD C-01（V1.1新增）明确规定部分超时强制汇总路径：\"A.基于已提交意见强制汇总（任务推进至'已提交'，报告中注明'部分审稿人超时未提交'）\"。generate_report 聚合 SUBMITTED 状态意见后直接生成报告，从不将 opinion_ids 与任务已接受分配（task.assignments）对比，SummaryReport 模型也无任何部分提交标记字段；全后端 grep \"超时未提交/部分审稿人\" 无命中。触发条件：任务经 handle_overdue(action=summarize) 或 force_summarize 以部分意见进入 SUBMITTED 后编辑生成报告。后果：强制汇总报告与全票汇总报告在数据结构上完全同形，编辑无从分辨终审建议仅基于部分审稿人意见，且报告连审稿人总数都不含（见另一条），误导终审决策。",
+    "evidence": "services.py:446-539 generate_report 全函数无 assignments 查询、无部分提交字段；models.py:5-20 SummaryReport 字段列表无相关标注；PRD 第263/479行\"报告中注明'部分审稿人超时未提交'\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 448,
+    "severity": "严重",
+    "title": "强制汇总（部分审稿人超时）生成的汇总报告未按 PRD C-01 要求注明\"部分审稿人超时未提交\"，报告与全票汇总不可区分",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD 状态流转表（249行）与异常场景表（480行）、AC-T-11 规定编辑强制提前汇总必须：①至少1份审稿意见已提交；②填写提前汇总原因；③未提交的审稿人标记为\"未提交-已汇总\"。实现 force_summarize 仅校验编辑部身份和 REVIEWING 状态即调用 execute_transition(task,'SUBMITTED',...,'编辑强制提前汇总')，三项要求全部未实现：不查已提交意见数、不接收 reason 参数（状态机仅用 reason.startswith('强制') 放行，state_machine.py:65）、ReviewAssignment.AssignmentStatus 枚举（tasks/models.py:67-75）根本不存在\"未提交-已汇总\"状态，handle_overdue(summarize) 路径同样不做标记。触发条件：编辑对 0 份已提交意见的任务调用 force_summarize。后果：任务进入 SUBMITTED 后，汇总生成因无意见抛 ValueError（summaries/services.py:472-473）返回 400，而 VALID_TRANSITIONS 无 SUBMITTED→PENDING/REVIEWING 出口，任务永久卡死、无法生成报告也无法重新分配审稿人；即便有部分意见，未提交审稿人也不会被标记，PRD 第480条通知对象（未提交的审稿人）无对应数据支撑。",
+    "evidence": "tasks/views.py:181-193 force_summarize 全函数无意见数校验、无 reason 参数；state_machine.py:65 `if not reason.startswith('强制'):` 仅作放行开关；tasks/models.py:67-75 AssignmentStatus 无\"未提交-已汇总\"值；PRD 249/277/480行、AC-T-11。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 181,
+    "severity": "严重",
+    "title": "强制提前汇总缺少 PRD 规定的全部前置校验与标记（至少1份意见、必填原因、未提交审稿人标记），0意见强制汇总会造成任务状态死锁",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD C-06 注4（V1.1新增）明确列出2位审稿人矩阵：\"1位'接收'+1位'大修'：匹配Rule-3（'倾向接收但需讨论'）\"。实现中 n=2 时 majority_threshold=ceil(2/2)=1，任何单一票即构成\"多数\"，链式匹配中 Rule-5（major=1≥1）先于 Rule-3 命中，返回\"建议大修（仅供参考，建议人工判断）\"。同样机制下 1小修+1拒稿 命中 Rule-6\"建议拒稿\"而非按 Rule-3 条件（小修≥多数+有拒稿）推出的\"倾向接收但需讨论\"。注：技术方案§2.3.3 伪代码与实现一致，即两份评审依据互相矛盾（PRD 的例子与其自身\"多数=≥半数向上取整\"定义冲突），但最终系统行为与 PRD 明文记载的验收场景不符，AC-S-13 验证时将暴露。",
+    "evidence": "services.py:372 `majority_threshold = math.ceil(total / 2)`（total=2 得 1）；services.py:406-408 Rule-5 在 Rule-3 之前评估；PRD 985行\"1位'接收'+1位'大修'：匹配Rule-3（'倾向接收但需讨论'）\"；PRD 963行\"多数统一定义：≥半数\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 406,
+    "severity": "一般",
+    "title": "2位审稿人\"1接收+1大修\"场景实现返回 Rule-5（建议大修），与 PRD C-06 注4 明确记载的 Rule-3（倾向接收但需讨论）不一致",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD C-06\"多数\"统一定义为\"推荐某意见的审稿人数 ≥ 审稿人总数/2，向上取整\"，审稿人总数指任务面板人数。实现 generate_report 将 reviewer_count 取为 recommendation_distribution['total']（已提交意见数），aggregate_opinions 只统计 SUBMITTED 意见，从不读取 task.assignments，因此强制汇总（部分超时）场景下分母缩小为已提交人数。触发条件：4位审稿人任务仅2位提交后被强制汇总，意见为 1大修+1拒稿。后果：实现按 majority=1 判拒稿\"多数\"返回 Rule-6\"建议拒稿（仅供参考）\"；若按审稿人总数4计算 majority=2，拒稿未达多数且接收+小修=0，应落入\"无法自动判定\"。同理5人任务2人提交（1接收+1小修）会得到 Rule-2\"倾向接收\"，实际仅40%面板表达意见。叠加报告无\"部分超时\"标注（前述发现），编辑会被少数意见导出的\"多数\"结论误导。",
+    "evidence": "services.py:487-488 `reviewer_count = recommendation_distribution['total']`；services.py:70-76 opinions 过滤 status='SUBMITTED'；PRD 963行\"多数统一定义：≥半数（即推荐某意见的审稿人数 ≥ 审稿人总数/2，向上取整）\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 487,
+    "severity": "一般",
+    "title": "强制汇总场景下规则引擎\"多数\"分母取已提交意见数而非审稿人总数，少数意见可被判定为\"多数\"结论",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §4.3.1 聚合输出结构规定维度对比表应含\"每个维度的各审稿人评分、平均分、评分范围、各审稿人文字意见摘要\"；§4.3.3 汇总报告结构【稿件信息】要求\"审稿人数量：N位、审稿模式：单盲/双盲\"（AC-S-06 报告完整性）。实现 dimension_comparison 每项仅含 dimensionId/dimensionName/scores[{reviewerId,reviewerName,opinionId,score,comment}]，无平均分与 min-max 范围字段；SummaryReportSerializer 也不暴露 reviewer_count/review_mode，报告数据中审稿人只能靠数 overall_comments 条目间接得知。触发条件：任一汇总报告生成/查看。后果：前端（SummaryDetail.vue:157-165 虽写了均值计算但读取的是不存在的 dimension_scores 字段）与后续消费方拿不到 PRD 定义的聚合输出结构，AC-S-01\"检查聚合数据正确性\"按文档口径验证不完整。",
+    "evidence": "services.py:114-134 dim_data 仅构造 dimensionId/dimensionName/scores 三键；serializers.py:20-36 无 reviewer_count/review_mode/平均分字段；PRD §4.3.1 聚合输出结构表、§4.3.3 报告结构、AC-S-06。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 114,
+    "severity": "一般",
+    "title": "维度对比聚合输出缺少 PRD 规定的平均分与评分范围，汇总报告缺审稿人数量与审稿模式（AC-S-01/AC-S-06）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §4.3.1 聚合输出结构规定修改建议汇总为\"按类型（内容/方法/格式/其他）归类的所有修改建议列表\"，§4.3.3 报告示例按\"内容类/方法类/格式类\"分组展示。实现 revision_suggestions_summary 的 by_dimension 以 sug['dimensionId']（缺省 'GENERAL'）为分组键，是维度轴而非类型轴；且表单侧 revision_suggestions 定义为 ListField(child=CharField())（apps/forms/serializers.py:125-130），意见数据结构根本不采集建议类型，全链路无内容/方法/格式/其他分类的实现位置。触发条件：任一含修改建议的汇总报告。后果：PRD 定义的修改建议分类汇总输出不存在，编辑看到的是按维度（或全部 GENERAL）混排的建议列表。",
+    "evidence": "services.py:153-158 `dim_id = sug.get('dimensionId', 'GENERAL')` 后 `by_dimension.setdefault(dim_id, []).append(...)`；forms/serializers.py:125-130 `revision_suggestions = serializers.ListField(child=serializers.CharField())`；PRD §4.3.1\"按类型（内容/方法/格式/其他）归类\"、§4.3.3 示例\"📝 内容类（X条）\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 150,
+    "severity": "一般",
+    "title": "修改建议汇总按 dimensionId 分组而非 PRD 要求的按类型（内容/方法/格式/其他）归类，且表单数据结构根本不采集建议类型",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §4.3.3 汇总报告结构示例中\"研究方法（正向一致，平均3.3分）\"（评分3,4,3）与\"写作水平（正向一致，平均3.7分）\"（评分4,4,3）均标注为正向一致；分歧识别规则规定\"max-min≤1 → 🟢 基本一致 + 分布信息\"，AC-S-04 要求所有分差≤1的维度被绿色标记。实现 analyze_consensus 对 diff≤1 但 2<平均分<4 的维度直接 continue，既不进 consensus_points（正向/负向门槛为 avg≥4 / avg≤2），detect_conflicts 又明确把 diff≤1 排除在冲突列表外。触发条件：任一维度评分一致但均分落在2-4开区间（如全员3分、3/4分混合）。后果：这些维度在 conflict_points 和 consensus_points 中双双缺席，报告中既无分歧标注也无一致标注，PRD 示例中本应显示的两条正向一致（3.3分、3.7分）会被丢弃，AC-S-04 对该类维度不成立。",
+    "evidence": "services.py:297-305 `if avg_score >= 4: POSITIVE ... elif avg_score <= 2: NEGATIVE ... else: continue`；services.py:223-225 `if diff <= 1: continue`；PRD §4.3.3 示例\"✅ 研究方法（正向一致，平均3.3分）\"、AC-S-04\"评分分差≤1的维度被绿色标记，显示分布信息\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 304,
+    "severity": "一般",
+    "title": "一致点分析丢弃平均分在(2,4)开区间的一致维度，与 PRD 报告示例直接矛盾，且这些维度在报告中无任何\"基本一致\"标注（AC-S-04）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD 边界条件表（1074行）与 AC-S-12 规定：仅1份审稿意见时\"可生成报告但标注'仅1份意见，对比功能受限'……终审建议标注'仅供参考，建议人工判断'，规则匹配结果标注'仅1份意见'\"。实现 match_rule 对 total≤2 统一追加\"（仅供参考，建议人工判断）\"后缀并置 advisoryOnly=True，不区分1份与2份：system_recommendation 中无\"仅1份意见\"标注，全报告无\"对比功能受限\"字样（全后端 grep 无命中）。触发条件：任务仅1位审稿人提交后被强制汇总并生成报告。后果：编辑看到的终审建议标注与2位审稿人场景完全相同，PRD 为单意见场景专门规定的两级提示（对比功能受限+仅1份意见）缺失，AC-S-12 验收不过。注：\"不执行分歧标注\"一项已满足（detect_conflicts 对有效评分<2 的维度跳过）。",
+    "evidence": "services.py:374-375 `advisory_only = total <= 2`；services.py:434-436 仅有 `conclusion = f'{conclusion}（仅供参考，建议人工判断）'`；services.py:490-496 system_recommendation 无单意见标注；PRD 1074行、AC-S-12。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 436,
+    "severity": "一般",
+    "title": "仅1份意见生成报告时缺少 PRD/AC-S-12 规定的\"仅1份意见，对比功能受限\"与\"规则匹配结果标注'仅1份意见'\"标注",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "技术方案§2.3.3 规定无规则匹配时返回 matchedRuleId=None、结论\"无法自动判定，请编辑综合判断\"；PRD 与技术方案均未定义任何 Rule-0 规则。实现兜底分支返回 matchedRuleId='Rule-0' 与结论文案\"无法自动判定，建议人工讨论\"，并附注\"现有规则未覆盖此推荐分布场景\"。对于一致的实际数据流该分支不可达（Rule-1~7 对任意 n 的全部分布穷举覆盖，tests.py:107-120 已验证），唯一可达入口是 match_rule_preview 调试端点：其 else 分支直接信任请求体中的 recommendation_distribution 与 reviewer_count（apps/summaries/views.py:156-168），二者可以不一致（如各计数为0而 reviewer_count=5），从而构造出产出 Rule-0 的响应，把一个文档中不存在的规则编号暴露给调用方。",
+    "evidence": "services.py:423-430 `matched_rule_id = 'Rule-0'; return {'matchedRuleId': 'Rule-0', 'conclusion': '无法自动判定，建议人工讨论', ...}`；技术方案§2.3.3 evaluate 无匹配时 `\"matchedRuleId\": None`；views.py:157-168 预览端点直接 int() 转换请求体分布不做一致性校验。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 424,
+    "severity": "建议",
+    "title": "兜底分支返回自造的规则编号 Rule-0，技术方案规定无匹配时 matchedRuleId 应为 None，且 Rule-0 在正常流程不可达、仅能经调试预览端点以不一致输入触达",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §4.3.4 规则表规定建议结论：Rule-1 为\"✅ 全票接收\"、Rule-2 为\"✅ 多数接收\"；S-07 修订后终审建议输出\"推荐意见分布 + 规则匹配结果（规则编号及建议结论）\"，即结论文案是规定输出值。实现 RULE_CONCLUSIONS 中 Rule-1 为\"建议接收\"、Rule-2 为\"倾向接收\"，且 Rule-2 的\"倾向接收\"与 Rule-3 的\"倾向接收但需讨论\"仅差三字，弱化了文档中\"多数接收\"与\"倾向接收但需讨论\"两档结论的区分度。其余五条规则（Rule-3/4/5/6/7）文案与 PRD 一致（仅省略 emoji）。触发条件：任一命中 Rule-1 或 Rule-2 的汇总报告。后果：报告与界面展示的终审建议结论文案与 PRD 规则表定义不一致。",
+    "evidence": "services.py:43-51 `'Rule-2': '倾向接收', 'Rule-1': '建议接收'`；PRD §4.3.4 规则表 Rule-1\"✅ 全票接收\"、Rule-2\"✅ 多数接收\"；AC-S-07\"建议结论与规则定义一致\"。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 49,
+    "severity": "建议",
+    "title": "Rule-1/Rule-2 的建议结论文案与 PRD 规则表规定值不一致（全票接收/多数接收 被改为 建议接收/倾向接收）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   }
+  ]
+ },
+ {
+  "dimension": "api-contract",
+  "findings": [
+   {
+    "description": "POST /api/tasks/<pk>/force_summarize/（tasks/views.py:190-192）以 reason='编辑强制提前汇总' 调用 StateMachineService.execute_transition；而 state_machine.py:62-70 对 (REVIEWING, SUBMITTED) 的校验是 `if not reason.startswith('强制')` 才检查未提交人数——'编辑强制提前汇总' 不以'强制'开头，于是只要存在任何 ACCEPTED 未提交的分配（即强制汇总的典型目标场景），就抛 StateMachineError。视图中该异常未捕获，直接变成 HTTP 500。仅在剩余审稿人全部处于 INVITED（未接受）状态时才会侥幸成功。PRD AC-T-11 要求该操作'至少1份意见提交后可强制汇总、需填写原因、未提交审稿人被标记'，而该端点不接收原因参数、不校验≥1份已提交、也不标记未提交审稿人。apps/tasks/tests.py:99-101 只用 reason='强制汇总' 直接测状态机，掩盖了视图层真实传入的 reason 不匹配的问题。",
+    "evidence": "views.py:191 `StateMachineService.execute_transition(task, 'SUBMITTED', request.user, '编辑强制提前汇总')`；state_machine.py:65 `if not reason.startswith('强制'):`；tests.py:101 用 `'强制汇总'` 直测状态机。PRD §2.3.3/AC-T-11、技术方案 §2.3.1 状态转换表'编辑强制提前汇总（≥1份已提交）'。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 191,
+    "severity": "致命",
+    "title": "force_summarize 端点在其设计场景下必然抛 StateMachineError 返回 500，PRD 要求的强制提前汇总流程不可用",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "UserViewSet 继承 ModelViewSet 并以 DefaultRouter 注册（users/urls.py:6），仅 create（views.py:29）做了 is_editor 校验。get_permissions（views.py:16-20）对除 login 外的所有动作只要求 IsAuthenticated。因此任意作者/审稿人凭合法 token 即可：GET /api/users/ 列出全部用户的邮箱、机构、角色（POB 信息泄露+审稿人枚举）；GET /api/users/<id>/ 查看任意用户；PUT/PATCH /api/users/<id>/ 修改任意用户（含 roles 与 password，可把他人改成 EDITOR 或改掉他人密码）；DELETE /api/users/<id>/ 删除任意账号。PRD §3.1.1/§6.2.1 规定账号由编辑部管理，角色权限模型在 API 层被完全击穿。",
+    "evidence": "users/views.py:16-20 `if self.action == 'login': return [AllowAny()]; return [IsAuthenticated()]`，无任何 action 级角色限制；update/destroy 未覆写，UserSerializer 的 roles/password 均为可写字段（serializers.py:7-12）。",
+    "file": "dev/backend/apps/users/views.py",
+    "line": 11,
+    "severity": "致命",
+    "title": "UserViewSet 以 ModelViewSet 全量暴露用户 CRUD，任意登录用户可列出、修改、删除任意用户并提升角色",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §5.3.1 规定'审稿任务状态变更为已决策时，系统自动启动第一阶段匿名化处理'，技术方案 §2.2 依赖表也明确'ReviewTask状态=DECIDED触发归档'。但 make_decision（tasks/views.py:214-245）只更新任务字段、走状态机和通知，从不调用 AnonymizationService.auto_anonymize；process_scheduled 管理命令（apps/tasks/management/commands/process_scheduled.py）也只处理提醒/邀请过期/审稿超时/分配困难通知；全代码库对 auto_anonymize 的引用仅有定义与一处未使用的 import（knowledge/views.py:26）。后果：知识库永远只有 bootstrap_dev 写入的 KI-SEED 种子数据，GET /api/knowledge/pending_reviews/ 恒为空，功能4的两阶段审核流程在真实数据上完全跑不通。注意这与已备案的'Celery 降级为 process_scheduled'不同——命令存在但根本不含归档逻辑。",
+    "evidence": "grep 全库：auto_anonymize 仅出现于 knowledge/services.py:65（定义）与 knowledge/views.py:26（未使用的 import）；make_decision 函数体（tasks/views.py:234-243）无归档调用；PRD §5.3.1'自动归档触发'、§4.5 流程'汇总数据自动归档至知识库'。",
+    "file": "dev/backend/apps/knowledge/services.py",
+    "line": 65,
+    "severity": "致命",
+    "title": "知识库自动归档触发链完全缺失：auto_anonymize 无任何调用点，DECIDED 后不会产生任何归档数据",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PUT /api/users/update_profile/（users/views.py:75-81）用完整 UserSerializer 对 request.user 做 partial 更新，该序列化器的 roles 字段可写且无枚举校验（serializers.py:5-13）。任何审稿人/作者把自己的 roles 改为 [\"EDITOR\"] 后即可通过所有 is_editor 检查（创建任务、分配审稿人、生成汇总、录入决策、审核知识库、导出数据等），形成自我提权。PRD §6.2.1 角色由编辑部账号体系管理，普通用户不应能自改角色。",
+    "evidence": "views.py:78 `serializer = UserSerializer(user, data=request.data, partial=True)`；serializers.py Meta.fields 含 'roles' 且 read_only_fields 不含 roles；roles 为 JSONField，无 ChoiceValidator。",
+    "file": "dev/backend/apps/users/views.py",
+    "line": 75,
+    "severity": "严重",
+    "title": "update_profile 使用全量 UserSerializer，用户可自行修改 roles 字段把自己提权为编辑部",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskViewSet 是 ModelViewSet，update/partial_update/destroy 均未覆写权限（views.py:16-36 仅 create 和各自定义 action 校验角色）。get_queryset 只限制可见范围：作者可见自己的任务、审稿人可见被分配的任务，于是作者可 PATCH /api/tasks/<id>/ 修改自己任务的可写字段——ReviewTaskSerializer 可写项包括 manuscript_file（审稿中途换稿件PDF）、author_user_id、template_id、deadline、review_mode、publish_opinions_to_author 等（serializers.py:43-52）；审稿人也可 PATCH 其被分配的任务。DELETE /api/tasks/<id>/ 可在任意状态（含 REVIEWING/SUMMARIZED）删除任务，并级联删除 assignments、ReviewOpinion、ReviewForm、StateLog 与 SummaryReport（各模型 task 外键均为 CASCADE），完全绕过状态机，破坏 PRD §2.3.3 的状态流转约束与 C-04 并发控制（version 字段在 update 路径中从未参与校验，PRD §2.6'并发操作冲突（编辑间）'的乐观锁要求未实现）。前端 taskApi.update 也在直接调用该 PATCH 端点。",
+    "evidence": "tasks/views.py:16 `class ReviewTaskViewSet(viewsets.ModelViewSet)`，无 update/destroy/partial_update 覆写；serializers.py:51 read_only_fields 不含 manuscript_file/author_user_id/deadline；summaries/models.py:9 task 外键 on_delete=CASCADE。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 16,
+    "severity": "严重",
+    "title": "任务资源的 router 级 PATCH/PUT/DELETE 无角色与状态校验：作者可在审稿中更换稿件文件甚至删除任务，级联抹掉全部意见与汇总报告",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TemplateViewSet（tasks/views.py:327-356）只对 create 和 toggle_status 校验 is_editor，update/partial_update/destroy 直接放行任意 IsAuthenticated 用户：审稿人/作者可 PATCH /api/templates/<id>/ 篡改维度配置（dimensions 为可写 JSONField，TemplateSerializer 无任何校验），也可 DELETE 系统预设模板。同时 update 未校验模板是否已被任务使用，违反 PRD §3.6'模板被修改：已使用模板不可修改（快照机制）'与 §5.3.2'编辑模板：修改未使用模板的配置｜编辑部'的双重约束——虽然表单用了快照，进行中的审稿不受影响，但模板库可被非编辑部人员破坏。",
+    "evidence": "views.py:340-346 仅 create 有 `if not request.user.is_editor`；update/destroy 未覆写；TemplateSerializer（serializers.py:5-12）dimensions 无结构/数量校验。PRD §5.3.2 模板管理权限表、§3.6 边界条件表。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 327,
+    "severity": "严重",
+    "title": "TemplateViewSet 的 update/destroy 无权限校验，任意登录用户可修改/删除模板（含系统预设模板与使用中的模板）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskSerializer（tasks/serializers.py:33-50）无条件输出 author_name/author_email（35-37 行）和嵌套 assignments（39 行，ReviewAssignmentSerializer 含 reviewer、reviewer_name、reviewer_email、reviewer_research_areas、invitation_note、rejected_reason），且 my_articles、GET /api/tasks/<pk>/ 等端点对作者和被分配审稿人都复用该序列化器。后果：(1) 作者通过 my_articles/任务详情看到全部审稿人真实姓名与邮箱（含已拒绝/过期分配）、编辑给审稿人的邀请说明与拒绝理由——单盲、双盲下作者都不应知道审稿人身份；(2) 被分配的审稿人通过 GET /api/tasks/<id>/ 看到作者姓名与邮箱——双盲模式下违规；(3) 审稿人之间互相可见。PRD §7.3 作者时间线明确标注'不暴露审稿人身份'，作者细粒度进度只需要计数（X位已接受/X位已提交），AC-T-13 要求'双盲模式下审稿人不可见作者信息，作者不可见审稿人身份'。forms 模块的 task_opinions 做了匿名化，但任务列表/详情接口把同一批身份信息原样吐出，匿名化被旁路。",
+    "evidence": "serializers.py:35-39 author_name/author_email/assignments 字段定义；views.py:308-316 my_articles 直接序列化；tasks/views.py:31 select_related/prefetch 无角色区分。PRD AC-T-13、§2.3.4、§7.3。",
+    "file": "dev/backend/apps/tasks/serializers.py",
+    "line": 39,
+    "severity": "严重",
+    "title": "任务序列化器对作者与审稿人双向泄露身份：assignments 暴露审稿人姓名/邮箱，author_name/author_email 暴露作者，双盲/单盲保护（AC-T-13）在任务接口层失效",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskViewSet.get_queryset（tasks/views.py:19-31）的 if/elif 链（is_editor→全量，is_reviewer→仅被分配，is_author→仅自己的）没有 else 分支，roles 为空或不含三种角色的用户会命中'无过滤'路径拿到 ReviewTask.objects.all()，再经 GET /api/tasks/、GET /api/tasks/<id>/、state_logs、PATCH、DELETE 获得全部任务数据（含作者邮箱、全部 assignments）。这样的账号可以合法产生：UserSerializer/UserCreateSerializer 的 roles 是 JSONField，DRF 只校验 required，不校验内容，创建 roles=[] 或 ['ADMIN'] 的用户都会通过（users/serializers.py:46-51）。对照 forms/views.py:58-59 与 forms/views.py:309-310 的 get_queryset 都有 `else: qs.none()` 兜底，唯独 tasks 模块缺失。",
+    "evidence": "tasks/views.py:23-30 `if user.is_editor: pass / elif user.is_reviewer: ... / elif user.is_author: ...` 后直接 return qs（无 else）；users/serializers.py:46 roles 字段无 choices 校验。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 30,
+    "severity": "严重",
+    "title": "任务 get_queryset 缺少无角色兜底分支，roles 为空/非法的账号可见全部任务；且 roles 字段无枚举校验，可创建任意角色值账号",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "技术方案 §1.3/§2.1 明确'文件下载需鉴权，通过后端API中转（非直接暴露文件路径），按角色验证下载权限'。但 FileService.get_file_path（files/services.py:131-157）在取到文件后直接返回路径，注释自述'当前策略：登录即可下载'，未做任何任务关联校验。UploadedFile.file_id 是自增 BigAutoField（models.py:7），可顺序枚举：任意作者/审稿人登录后逐个请求 GET /api/files/1/download/、/api/files/2/download/…即可下载全平台所有未发表稿件PDF——对学术平台而言是核心资产泄露，也破坏双盲（审稿人可看未分配稿件）。",
+    "evidence": "files/services.py:154-157 `# 鉴权：已登录用户均可下载（审稿人需查看稿件）…当前策略：登录即可下载 return abs_path`；技术方案 §2.1 访问控制行。",
+    "file": "dev/backend/apps/files/services.py",
+    "line": 156,
+    "severity": "严重",
+    "title": "稿件 PDF 下载无按角色授权：任意登录用户可枚举自增 file_id 下载任意稿件全文，违反技术方案的按角色验证要求",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "GET /api/files/<id>/check_metadata/（files/views.py:146-187）直接 UploadedFile.objects.get(file_id=pk) 后返回 original_name、pdf_metadata_author、metadata_warning 及匿名化检查清单，全程没有像 download 那样调用 FileService 做权限判断，也没有 is_editor 校验。该接口本应服务编辑部双盲检查（PRD §2.6 S-04），现在任何登录用户都可以枚举 file_id 探测任意稿件的原始文件名与 PDF 元数据中的作者姓名——元数据作者字段正是平台要保护的匿名信息。",
+    "evidence": "views.py:161 `uploaded_file = UploadedFile.objects.get(file_id=pk)` 后无任何 user 权限判断；对比 download 动作调用了 FileService.get_file_path(pk, request.user)。",
+    "file": "dev/backend/apps/files/views.py",
+    "line": 161,
+    "severity": "严重",
+    "title": "check_metadata 端点完全无权限校验：任意登录用户可探测任意稿件的文件名、PDF 元数据作者等匿名化信息",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "opinions/submit（forms/views.py:315-458）只校验 assignment.assignment_status ∈ ['ACCEPTED','REVIEWING']，从不检查 task.status。编辑 force_summarize/handle_overdue 把任务推进到 SUBMITTED 后，未提交审稿人的 assignment 仍是 ACCEPTED（AC-T-11 要求的'未提交-已汇总'标记未实现），他们仍可成功提交：意见入库、assignment 变 SUBMITTED，但任务已不是 REVIEWING，check_and_transition_on_submit 直接返回（state_machine.py:124-125），不会触发任何状态变化。PRD §4.6'报告生成后审稿人补充意见'要求'编辑手动触发重新生成汇总报告；旧报告归档保留'，而 summaries/views.py:106-110 的 generate 强制 task.status == 'SUBMITTED'，SUMMARIZED 后必然 400；SummaryService.generate_report（services.py:498-519）对已有报告也是原地覆盖更新而非归档保留。结果是：已生成报告的任务收到补交意见后，报告永久过期且无法刷新，PRD 边界场景无 API 路径可走。",
+    "evidence": "forms/views.py:362 `if assignment.assignment_status not in ['ACCEPTED', 'REVIEWING']`（无 task.status 检查）；summaries/views.py:106 `if task.status != 'SUBMITTED'`；PRD §4.6 边界条件'报告生成后审稿人补充意见'。",
+    "file": "dev/backend/apps/forms/views.py",
+    "line": 362,
+    "severity": "严重",
+    "title": "意见提交不校验任务状态：任务已 SUBMITTED/SUMMARIZED/DECIDED 后仍可补交意见，且汇总报告无法重新生成，形成不可恢复的数据不一致",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "POST /api/tasks/<pk>/handle_overdue/（tasks/views.py:195-212）不像 force_summarize 那样先查 task.status，直接调用 StateMachineService.handle_all_overdue。当任务不在 REVIEWING（例如 PENDING 或已 SUMMARIZED）时，execute_transition 找不到合法转换路径抛 StateMachineError，而该视图没有 try/except（对比 summaries/generate 有捕获），客户端收到 500 而非 400。同时该端点不校验'其余审稿人全部超时'这一 PRD C-01 触发条件：对一个仍有 ACCEPTED 在审审稿人的 REVIEWING 任务执行 action=rollback 也能成功（validate_transition 对 REVIEWING→PENDING 的校验被固定 reason '编辑选择回退…' 放行），编辑可在未超时情况下终止在审流程，超出 PRD 定义的操作边界。",
+    "evidence": "views.py:204-212 无状态检查、无异常捕获；state_machine.py:179-182 rollback 路径 reason 固定为'编辑选择回退待分配…'，validate_transition:76 的 startswith('编辑选择回退') 恒真；PRD §2.3.3 状态流转表触发条件'部分已提交意见后其余全部超时'。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 202,
+    "severity": "严重",
+    "title": "handle_overdue 缺任务状态与超时前置校验：对非 REVIEWING 任务调用触发未捕获 StateMachineError 返回 500；对未超时任务可随意回退",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "POST /api/forms/ai_review/ 的返回由 AIReviewService.generate_review 组装（ai_review.py:255-260），dimensionId 取自硬编码的 [\"SIGNIFICANCE\",\"NOVELTY\",\"METHODOLOGY\",\"WRITING\"]，且只输这四个维度。但平台模板（含系统预设四维模板，tasks/views.py:368-373 init_default_templates）的 dimensionId 是 D1-D4；FormService.validate_opinion（forms/services.py:115-152）要求提交的评分必须精确覆盖表单维度集合，多出的维度直接报'存在表单未定义的维度评分'。前端 ReviewForm.vue:317-326 直接按返回的 dimensionId 预填 formData.scores[dimId]，结果 AI 生成的分数/评语落在 D1-D4 之外的键上，提交时要么缺 D1-D4 被拒、要么 AI 内容整体丢失——'AI 辅助审稿，审稿人可在 AI 结果基础上修改后提交'（T-42/PRD §3.5）链路断裂。对使用自定义模板（维度数/ID 任意）的任务，AI 结果同样只返回这四个硬编码维度。",
+    "evidence": "ai_review.py:255 `for dim_id in [\"SIGNIFICANCE\", \"NOVELTY\", \"METHODOLOGY\", \"WRITING\"]`；tasks/views.py:369-372 模板维度 dimensionId 为 'D1'-'D4'；forms/services.py:150-152 多余维度报错；ReviewForm.vue:322 `formData.scores[dimId] = ds.score`。",
+    "file": "dev/backend/apps/forms/ai_review.py",
+    "line": 255,
+    "severity": "严重",
+    "title": "AI 审稿返回的 dimensionId（SIGNIFICANCE/NOVELTY/METHODOLOGY/WRITING）与表单模板维度（D1-D4）不匹配，AI 结果无法预填也无法通过提交校验",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "SummaryReportViewSet 的 list（views.py:30-33）、retrieve（62-65）、detail（77-80）第一行都是 `if not request.user.is_editor: return 403`，没有任何作者可访问的汇总报告端点。PRD §4.4 输出定义明确列出'汇总报告-作者版｜作者（经发布后）｜结构化页面｜匿名化版本，隐藏审稿人身份'，验收标准 AC-S-11 要求'作者版报告隐藏审稿人身份信息，双盲保护有效'，AC-S-14 要求报告可随时回看。作者目前只能通过 opinions/task_opinions 看到逐条匿名意见，推荐分布/维度对比/分歧分析等汇总层信息完全拿不到。",
+    "evidence": "summaries/views.py:33/65/80 三处 403 拦截；PRD §4.4 输出定义、AC-S-11/AC-S-14。",
+    "file": "dev/backend/apps/summaries/views.py",
+    "line": 33,
+    "severity": "严重",
+    "title": "汇总报告作者版端点缺失：summaries 全部端点仅编辑部可用，PRD 输出定义与 AC-S-11 要求的匿名化作者版报告无任何 API 承载",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "KnowledgeService.get_detail（knowledge/services.py:511-540）对审稿人仅限制'只能看 APPROVED 条目'，序列化用的是 KnowledgeItemSerializer，其 fields 明确包含 'source_task_id' 和 'source_report_id'（serializers.py:32-33）。GET /api/knowledge/<id>/detail/ 对审稿人开放，于是审稿人能拿到归档条目对应的原任务编号与报告编号。PRD §5.3.4 权限矩阵规定'查看来源信息：审稿人❌、编辑部✅'；同模块的 export_data（services.py:562-577）特意剔除 source_task_id 并注释'防止溯源'，说明产品意图明确，detail 接口却把溯源字段发给了不该看的角色。",
+    "evidence": "serializers.py:30-33 fields 含 'source_task_id','source_report_id'；services.py:527-529 仅校验 APPROVED 后用该序列化器返回；services.py:562 导出剔除 source_task_id；PRD §5.3.4 权限矩阵。",
+    "file": "dev/backend/apps/knowledge/serializers.py",
+    "line": 32,
+    "severity": "严重",
+    "title": "知识库详情接口向审稿人返回 source_task_id/source_report_id，违反 PRD 权限矩阵'查看来源信息：审稿人❌'",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskCreateSerializer（tasks/serializers.py:62-80）只校验 expected_reviewer_count（1-5）和 keywords（3-10），deadline 直接映射模型 DateField，无 validate_deadline。PRD §2.3.1 创建字段表'截止日期｜不得早于当前日期+7天'、§2.6 边界条件'截止日期设置不合理→表单校验拦截'、§2.4 输入定义'不早于当前日期+7天'三处明确要求。当前实现允许创建截止日期为昨天/今天的任务，随后 process_scheduled 的 _mark_overdue 会立刻把相关分配打成 OVERDUE，或 dashboard 的 overdue 筛选立即命中，产生'出生即超时'的任务。",
+    "evidence": "serializers.py:62-80 仅有 validate_expected_reviewer_count 与 validate_keywords；PRD §2.3.1/§2.4/§2.6 对截止日期的 +7 天约束。",
+    "file": "dev/backend/apps/tasks/serializers.py",
+    "line": 67,
+    "severity": "一般",
+    "title": "任务创建缺少'截止日期不早于当前日期+7天'的服务端校验",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "assign_reviewers（tasks/views.py:69-83）取 request.data.get('deadline') 原样赋给 ReviewAssignment.deadline（DateField）：传 'garbage' 或 '15/01/2026' 等非法格式时，Django 在 create 落库阶段抛 django ValidationError，视图未捕获，返回 500 而非 400。合法但早于今天（甚至早于邀请有效期）的日期也不做任何检查，PRD S-02'重新分配新审稿人的截止日期从重新分配时起算至少7天后'无对应校验。另外 PRD §2.3.2 要求'为每位审稿人设置截止日期/分别设置截止日期'，该接口只接受一个全组共用的 deadline。",
+    "evidence": "views.py:70 `deadline_str = request.data.get('deadline')`；views.py:83 `task_deadline = deadline_str if deadline_str else ...` 未经解析校验直接入库；PRD §2.3.2 分配字段表、S-02。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 83,
+    "severity": "一般",
+    "title": "assign_reviewers 的 deadline 参数不校验格式与未来日期：非法字符串导致保存期 ValidationError 变 500；全组共用一个截止日期与 PRD'分别设置'不符",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "assign_reviewers（tasks/views.py:73-102）校验了 reviewer_ids 非空与角色合法，但不检查该任务已有/新建的分配总数。PRD §2.3.2 业务规则'一篇稿件可分配1-5位审稿人'、§2.4 输入定义'审稿人选择 1-5位'。创建任务时的 expected_reviewer_count 校验了 1-5，但分配环节与它以及与实际 assignments 数量均无联动，编辑可一次或分多次给同一稿件分配 6+ 位审稿人。",
+    "evidence": "views.py:73-79 仅校验 `if not reviewer_ids` 与角色匹配；无 `task.assignments.count() + len(...) <= 5` 类检查；PRD §2.3.2'一篇稿件可分配1-5位审稿人'。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 77,
+    "severity": "一般",
+    "title": "分配审稿人不限制总人数上限（PRD：一篇稿件可分配1-5位），可分配任意多位",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskCreateSerializer 的 template_id 与 manuscript_file 都是普通 CharField（serializers.py:70），不校验模板是否存在、是否 ACTIVE（PRD AC-F-09'停用模板不可在新任务中关联'），也不校验稿件文件记录是否存在。传一个不存在的 template_id 时任务创建成功（201），但表单是懒创建的：审稿人调用 get_form/submit 时走兜底 FormService.create_form_for_task（forms/views.py:122-127、369-372），其中 Template.objects.get(template_id=…) 抛出的 Template.DoesNotExist 无人捕获，变成 500；manuscript_file 指向不存在的文件时 ai_review 404、下载 404。同时 PRD C-02 要求'任务创建时必须确定审稿模板，如未指定则使用学科默认模板并自动关联'，当前序列化器把 template_id 设为必填，未传直接 400，学科默认模板回退逻辑不存在。",
+    "evidence": "serializers.py:70 template_id/manuscript_file 为 CharField 无存在性校验；forms/views.py:126 `form = FormService.create_form_for_task(task)` 无 try/except；services.py:42 `Template.objects.get(template_id=task.template_id)`；PRD §2.3.1 C-02、AC-F-09。",
+    "file": "dev/backend/apps/tasks/serializers.py",
+    "line": 70,
+    "severity": "一般",
+    "title": "任务创建对 template_id/manuscript_file 不做存在性与状态校验：伪造 ID 可创建成功，审稿人打开表单时兜底建表单抛 Template.DoesNotExist 变 500",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "make_decision（tasks/views.py:224-232）取 `decision = request.data.get('decision', '')`，仅检查非空和 notes≥100 字，decision 本身不校验枚举（PRD §2.4 输入定义'终审决策：枚举+文本，接收/小修/大修/拒稿'）。任意字符串（如 'MAYBE'、'录用吧'）会写入 final_decision 并展示给作者、流入知识库标签（knowledge/services.py:258-259 直接用 final_decision 做标签）。另外 PRD §4.5 决策表单的发布选项是三选一（发布全部意见（匿名化）/仅发布汇总摘要/不发布），接口只接收布尔 publish，'仅发布汇总摘要'这一档在 API 契约中不存在。",
+    "evidence": "views.py:224-232 无枚举校验；models.py:39 final_decision 为无 choices 的 CharField；PRD §2.4 输入定义、§4.5 发布选项三选一。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 224,
+    "severity": "一般",
+    "title": "make_decision 的 decision 无枚举校验，任意字符串可入库；publish 仅布尔，缺少 PRD 三档发布选项",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "FormService.validate_opinion（forms/services.py:137-167）对维度 comment 只做 `len(comment_cleaned) < min_words` 下限判断，对 overall_comment 只做 `<100` 判断，均无上限。PRD §3.4 输入定义'各维度文字说明 50-2000字/维度''综合评语 100-3000字'、§3.6'字数超限→阻止'。当前 API 接受 10 万字的综合评语入库，汇总报告/知识库匿名化扫描等下游都要处理超长文本。同文件同函数对 revision_suggestions 只按 ListField(str) 收（serializers.py:125-130），而 PRD 要求'结构化列表，每条含类型（内容/方法/格式/其他）+内容'，类型字段在契约中不存在，汇总端的'按类型分类汇总'（PRD §4.3.3 修改建议汇总：内容类/方法类/格式类）只能按 dimensionId 粗分。",
+    "evidence": "services.py:141 `if len(comment_cleaned) < min_words`；services.py:164 `if len(overall_comment) < 100`；均无 max 比较；serializers.py:125-130 revision_suggestions 为 ListField(CharField)；PRD §3.4/§3.6、§4.3.3。",
+    "file": "dev/backend/apps/forms/services.py",
+    "line": 141,
+    "severity": "一般",
+    "title": "意见校验只有字数下限：维度评语无 2000 字上限、综合评语无 3000 字上限；修改建议未按 PRD 结构化（类型+内容）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "validate_opinion 的评分检查（forms/services.py:128-135）是 `score_int = int(score)` 后判 1-5，然后返回的 dimension_scores 是原始输入（services.py:174 未做清洗转换）。score=4.5 时 int(4.5)=4 通过校验，但 4.5 原样存入 dimension_scores；score=True 时 int(True)=1 同样通过并存储 true。汇总端 detect_conflicts/analyze_consensus 对这些混合类型做 max/min/sum 运算虽大多不抛错，但评分'1-5整数'（PRD §3.4 输入定义'整数（1-5）'、§3.3.2 评分机制）的契约形同虚设，报告中的评分/均值可能带小数或布尔。草稿序列化器（forms/serializers.py:184-202）同样逻辑。",
+    "evidence": "services.py:131-135 `score_int = int(score); if not (1 <= score_int <= 5)` 后未回写 score；返回值 `'dimension_scores': dimension_scores` 为原始列表；serializers.py:193 同样 `int(score)`。",
+    "file": "dev/backend/apps/forms/services.py",
+    "line": 131,
+    "severity": "一般",
+    "title": "评分校验可被非整数值绕过：int(score) 截断判断后原始值入库，4.5/true 等可存入 dimension_scores",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "settings.py:138-139 配置了全局 DEFAULT_PAGINATION_CLASS=PageNumberPagination、PAGE_SIZE=20，而 User、ReviewTask、Template 三个模型均无 Meta.ordering，对应列表视图的 queryset 也未 order_by：GET /api/users/（users/views.py:13 User.objects.all()）、GET /api/tasks/（tasks/views.py:21 起的 get_queryset）、GET /api/templates/（tasks/views.py:334-338）都会触发 DRF 的 UnorderedObjectListWarning，且 PostgreSQL 无隐式排序，翻页时同一行可能在不同页重复或被跳过，分页结果不稳定。这是任务书中提到的 templates 列表告警的根因，且同样影响 users 与 tasks 两个列表。对照：notifications（-created_at）、summaries（-generated_at）已排序。",
+    "evidence": "settings.py:138-139；users/models.py、tasks/models.py 中三个类均无 Meta.ordering；tasks/views.py:334-338 Template 列表无 order_by。",
+    "file": "dev/backend/review_platform/settings.py",
+    "line": 138,
+    "severity": "一般",
+    "title": "users/tasks/templates 三个列表端点 queryset 无排序：全局分页下触发 UnorderedObjectListWarning 且分页顺序不稳定",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "同一端点 POST /api/opinions/submit/ 存在三种 400 响应体：缺 task_id 时返回 {'error': '缺少参数 task_id'}（views.py:339-342）；字段缺失/类型错时是 DRF 默认的字段键值格式（如 {'dimension_scores': ['该字段是必填项。']}，views.py:388 is_valid(raise_exception=True)）；而维度字数不足/评分越界等业务校验经 ReviewOpinionSubmitSerializer.validate 把 FormService 的 ValueError 转成 serializers.ValidationError(str(e))（serializers.py:143-145），DRF 序列化为 {'non_field_errors': ['维度[D1]文字说明不足50字…']}——并非 {'error'}。其他端点同样混用：登录失败 {'error'} 401 vs LoginSerializer 校验失败 DRF 格式 400；my_opinion 404 用 {'message': '暂无意见记录'}（views.py:598-602）而其余 404 均用 {'error'}。前端统一错误处理只读取 response.data.detail || response.data.error（frontend/src/api/index.js:43），DRF 字段格式与 non_field_errors 均落入兜底文案，具体校验错误信息（哪个维度差多少字）到不了用户。",
+    "evidence": "views.py:341 {'error': '缺少参数 task_id'}；serializers.py:143-145 raise ValidationError(str(e))→non_field_errors；views.py:600 {'message': …}+404；api/index.js:43 `response.data?.detail || response.data?.error || '请求参数错误'`。",
+    "file": "dev/backend/apps/forms/views.py",
+    "line": 388,
+    "severity": "一般",
+    "title": "错误响应格式三种混用：{'error':...}、DRF 字段级错误、non_field_errors 在同一端点交替出现；404 也有 {'message'} 变体",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "同样是列表端点，响应包络有三种互不兼容的形态：(1) DRF 分页格式 {count,next,previous,results}——dashboard（tasks/views.py:274-277）、notifications list、summaries list；(2) {count, results} 无分页——my_tasks（views.py:296-300）、my_articles（views.py:312-316）、users/reviewers（users/views.py:117-121）；(3) {count, page, total_pages, results}——knowledge search 与 pending_reviews（knowledge/views.py:144-150，手工分页）。前端与调用方必须按端点各写一套取数逻辑，页码参数也只在部分端点生效（my_tasks/my_articles/reviewers 完全不分页，数据量增长后全量返回）。",
+    "evidence": "tasks/views.py:297-300 `return Response({'count': len(...), 'results': ...})`；knowledge/views.py:145-149 手工 page/total_pages；settings.py:138 全局 DRF 分页仅作用于走 paginate_queryset 的端点。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 297,
+    "severity": "一般",
+    "title": "列表接口响应包络不统一：同一平台并存三套分页/包裹结构",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "task_opinions 的作者分支（forms/views.py:653-665）允许 status ∈ ['SUMMARIZED','DECIDED'] 即返回全部已提交意见，唯一前置是 task.publish_opinions_to_author——但该字段在模型里默认 True（tasks/models.py:41），真正的发布决定发生在 make_decision（SUMMARIZED→DECIDED 时编辑才选择是否发布）。于是任务一到 SUMMARIZED（编辑尚未录入决策、尚未做发布选择），作者就能读到全部匿名意见；之后编辑即使选'不发布'也为时已晚。PRD §7.3 流程中作者'查看审稿意见'位于'查看终审决策'之后（审稿完成后），§3.4/§4.4 输出定义均写明作者侧输出'经发布后'。",
+    "evidence": "views.py:656 `if task.status not in ['SUMMARIZED', 'DECIDED']`；views.py:661 publish 检查基于默认 True 的字段；models.py:41 `publish_opinions_to_author = models.BooleanField(default=True)`；PRD §7.3 步骤3→4 顺序、§3.4'作者（经发布后）'。",
+    "file": "dev/backend/apps/forms/views.py",
+    "line": 656,
+    "severity": "一般",
+    "title": "作者在任务 SUMMARIZED（尚未决策、发布选项尚未确定）即可读取全部审稿意见，提前于 PRD 流程且绕过发布控制",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "search（knowledge/services.py:441-446）的评分区间筛选实现为 `anonymized_dimensions__contains=[{'avg': 4}]`，但 anonymized_dimensions 的实际结构来自 report.dimension_comparison 清洗（services.py:122-137），元素只有 dimensionId/dimensionName/scores 等键，从不包含 'avg' 键，因此 score_range=high/mid_high 的 JSON contains 条件永远匹配不到任何行（恒空结果），score_range=low/mid 等其他取值则被完全忽略（无分支处理，静默不过滤）。PRD §5.3.3 检索条件表要求'评分区间：按某维度评分范围筛选（如创新性3-5分）'、'模板：按使用的审稿模板筛选'以及'按相关度/按时间/按评分排序'——模板筛选参数完全不存在，sort_by=score 实际按 review_year/month 排序（services.py:474-478），按评分排序未实现。这些是筛选/排序参数被接受但行为错误或缺失，超出了已备案的'ES 降级为 icontains'范围。",
+    "evidence": "services.py:444 `qs.filter(anonymized_dimensions__contains=[{'avg': 4}])  # 简化匹配`；services.py:127-133 清洗后的维度对象无 avg 键；services.py:476 sort_by=='score' 实际 order_by('-review_year','-review_month')；PRD §5.3.3 检索条件表。",
+    "file": "dev/backend/apps/knowledge/services.py",
+    "line": 444,
+    "severity": "一般",
+    "title": "知识库检索的 score_range 过滤条件与数据结构不符永远匹配为空，模板筛选与按评分排序未实现",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §2.4 输入定义'审稿人接受/拒绝：邀请有效期内响应'、§2.3.2 分配字段'邀请有效期：审稿人接受/拒绝邀请的截止时间'。accept_invitation（tasks/views.py:116-143）与 reject_invitation（145-178）只检查 assignment_status == 'INVITED'，不比较 invitation_expiry 与当前日期。过期标记依赖 process_scheduled 的 _expire_invitations 每日批处理（process_scheduled.py:68-90），两次 cron 执行之间（最长约24小时）已过期的邀请仍可被成功接受并触发 ASSIGNED→REVIEWING 状态转换，形成与批处理竞态的不一致：编辑可能已按'邀请超时'处理，审稿人却已入场审稿。",
+    "evidence": "views.py:126-127 仅校验 `assignment.assignment_status != 'INVITED'`；assignment.invitation_expiry 字段在两个 action 中均未读取；process_scheduled.py:12 注释'由 cron/launchd 每日调度'。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 122,
+    "severity": "一般",
+    "title": "接受/拒绝邀请不校验 invitation_expiry，过期邀请在两次定时任务之间仍可被接受",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "dashboard（tasks/views.py:270-271）直接 `qs = qs.order_by(sort)`，sort 来自 query 参数，无白名单：传 ?sort=xyz 或 ?sort=author_email 之类不存在的字段，Django 在查询求值（分页 count）时抛 FieldError，未捕获返回 500，而参数错误应返回 400。?sort=（空字符串）同样触发异常。另外该端点的 status/subject 筛选值不做枚举校验，非法值静默返回空列表（my_tasks 的 status 同理），调用方无法区分'确实没数据'与'传错了参数'。",
+    "evidence": "views.py:270-271 `sort = request.query_params.get('sort', '-created_at'); qs = qs.order_by(sort)`；无字段白名单与异常处理。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 271,
+    "severity": "一般",
+    "title": "dashboard 的 sort 参数无白名单：非法排序字段触发 FieldError 返回 500 而非 400",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "login（users/views.py:62-67）返回 {'access', 'refresh', 'user'}，但 review_platform/urls.py 与 apps/users/urls.py 均未挂载 rest_framework_simplejwt 的 token refresh 路由，全后端也无任何自定义刷新端点（grep TokenRefresh 无结果）。refresh token 发给客户端后在 API 契约中无处可用：access token 12 小时过期后（settings.py:144），用户只能重新登录。前端 api/index.js:29-34 收到 401 也是直接清 token 跳登录页，未做刷新。登录响应中承诺的 refresh 字段是死契约。",
+    "evidence": "users/views.py:65 `'refresh': str(refresh)`；review_platform/urls.py 与 apps/users/urls.py 无 simplejwt include；settings.py:144 ACCESS_TOKEN_LIFETIME=12h；api/index.js:30-34 401 直接登出。",
+    "file": "dev/backend/apps/users/views.py",
+    "line": 65,
+    "severity": "一般",
+    "title": "登录接口签发 refresh token，但后端未挂载任何 token 刷新端点，12 小时后 access 过期只能强制重新登录",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §2.6'邀请超时未响应'的处理是'编辑部可重新分配或延期'。当前 API 里：assign_reviewers 对已存在 (task, reviewer) 记录直接 continue 跳过（tasks/views.py:88-90，且模型 unique_together('task','reviewer')，tasks/models.py:105），被标记 EXPIRED/REJECTED 的审稿人无法再次收到同一任务的邀请；也不存在修改 invitation_expiry 或 assignment.deadline 的端点（ReviewAssignmentSerializer 虽有可写字段，但没有任何路由暴露 assignment 的 update——任务/分配资源的写路径只有任务级 PATCH）。编辑实际只剩'换新审稿人'一条路，PRD 给出的两种处置手段之一（延期）完全无接口支撑，'重新分配'对同一人也走不通。",
+    "evidence": "views.py:89-90 `if ReviewAssignment.objects.filter(task=task, reviewer=reviewer).exists(): continue`；models.py:105 `unique_together = [('task', 'reviewer')]`；全 urls.py 无 assignment 更新/延期路由；PRD §2.6 邀请超时处理第3条。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 89,
+    "severity": "一般",
+    "title": "邀请超时后既无'延期'接口也无法重新邀请同一审稿人：assign_reviewers 因 (task,reviewer) 唯一约束静默跳过",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "upload_pdf（files/services.py:52-57）对 Content-Type 不在 ['application/pdf'] 的情况只 logger.warning，不抛 ValueError；唯一硬校验是扩展名 .pdf。把任意非 PDF 文件改名为 .pdf 即可通过 POST /api/files/upload/（201），PRD §2.6'稿件文件格式错误：上传非PDF文件→上传时即时校验→阻止上传'未满足——元数据读取阶段（services.py:93-109）解析失败也仅 warning 不阻断。伪 PDF 入库后，任务创建照常成功，ai_review 的 PyMuPDF 解析、下载方阅读都会失败，错误被推迟到审稿工作台。",
+    "evidence": "services.py:53-57 `if content_type … not in ALLOWED_CONTENT_TYPES: logger.warning(...)`（无 return/raise）；services.py:107-109 元数据异常仅 warning；PRD §2.6 稿件文件格式错误行。",
+    "file": "dev/backend/apps/files/services.py",
+    "line": 56,
+    "severity": "一般",
+    "title": "文件上传仅校验扩展名，Content-Type 异常只记日志不拦截：改名的非 PDF 文件可上传成功，违反'阻止上传'要求",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §6.2.6 规定 DimensionComparison 必填子字段 averageScore（Float）、scoreRange、scoreDistribution、conflictLevel（枚举 SEVERE/OBVIOUS/CONSENSUS）、comments；ConflictPoint 的 conflictLevel 枚举为 SEVERE/OBVIOUS。而 SummaryService.aggregate_opinions 生成的 dimension_comparison 元素只含 dimensionId/dimensionName/scores（summaries/services.py:113-134），前端/下游拿不到每维度的均分、范围与分歧级别，只能自行再算；detect_conflicts 生成的级别值是 'MODERATE'（services.py:229-231），与 PRD 枚举 'OBVIOUS' 不一致。overall_comments 也按 PRD 应为 {reviewerId(匿名), comment}，实际含 reviewerId/reviewerName 真实身份（services.py:176-186，当前仅编辑部可见故影响有限，但与实体定义不符）。",
+    "evidence": "services.py:114-134 dim_data 仅三个键；services.py:230 `level = 'MODERATE'`；PRD §6.2.6 DimensionComparison/ConflictPoint 子结构表（averageScore 必填、conflictLevel 枚举 SEVERE/OBVIOUS/CONSENSUS）。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 127,
+    "severity": "建议",
+    "title": "汇总报告 dimension_comparison 结构缺少 PRD §6.2.6 的必填子字段（averageScore/scoreRange/scoreDistribution/conflictLevel/comments），分歧级别枚举值与 PRD 不一致",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "UserSerializer.create 与 UserCreateSerializer.create（users/serializers.py:15-24、53-60）在不传 password 时统一 set_password('changeme123')，注释称'首次登录强制修改'但全代码库没有任何首次登录改密检测或强制标记（User 模型无 must_change_password 类字段，登录/Me 接口也不返回相关状态）。POST /api/users/ 是正式的编辑部建号 API（PRD §3.1.1），建出的每个账号都默认持有公开的弱口令，任何知道该约定的人可直接登录他人账号。此问题位于 API 序列化器路径，与已备案的'bootstrap_dev 演示账号统一默认密码（仅开发环境）'不是同一代码点。",
+    "evidence": "serializers.py:21 `user.set_password('changeme123')  # 默认密码，首次登录强制修改`；serializers.py:57 `user.set_password(password or 'changeme123')`；User 模型（users/models.py:6-53）无强制改密字段。",
+    "file": "dev/backend/apps/users/serializers.py",
+    "line": 57,
+    "severity": "建议",
+    "title": "API 创建用户未传密码时静默落为默认密码 changeme123，且无任何'首次登录强制修改'机制（区别于已备案的 bootstrap_dev 演示账号场景）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   }
+  ]
+ },
+ {
+  "dimension": "notify-scheduled",
+  "findings": [
+   {
+    "description": "_notify_editor_in_chief 仅查询 status='PENDING' 且 retry_count>3 的任务（189-191行）。但 PRD S-02（PRD 186行、273/274行、476/477行）明确要求的是『超时（审稿超时或邀请超时）48小时内编辑未处理时，系统自动通知主编介入』：场景A——某审稿人邀请已 EXPIRED 超过48小时而编辑未重新分配，此时任务可能仍是 ASSIGNED（还有其他存活邀请）或虽回退 PENDING 但 retry_count 仅+1，retry_count 不大于3，永不进入查询集；场景B——任务 REVIEWING 下审稿人已 OVERDUE、三选一通知发出超过48小时编辑未处理，任务不是 PENDING，同样永不触发。代码实际实现的触发条件（回退超3次的 PENDING 任务每48小时重复提醒）与 PRD 指定的两个场景均不重合，S-02 的超时升级机制对最典型的超时场景完全失效，超时任务只能靠每日重复的三选一站内通知催办，无主编升级通道。决策日志#011 第4项仅备案了『四类定时逻辑收敛为管理命令』的机制降级，未备案改变 S-02 的触发条件。",
+    "evidence": "process_scheduled.py:189-191 `difficult = ReviewTask.objects.filter(status='PENDING', retry_count__gt=3)`；PRD 186行『超时（审稿超时或邀请超时）48小时内编辑未处理时，系统自动通知主编介入』；PRD 477行『超时48小时编辑未处理时自动通知主编』；通知对象列『审稿人->编辑部->主编（48小时未处理时）』",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 189,
+    "severity": "严重",
+    "title": "48小时自动通知主编的触发条件与 PRD S-02 不符：邀请超时、审稿超时两个指定场景永远不会触发",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "_mark_overdue 第二段（151-160行）统计任务是否『全部到期』时：assignments 只排除 REJECTED（153行），而 accepted 只统计 ('ACCEPTED','REVIEWING','SUBMITTED','OVERDUE')（154-155行）——仍处于 INVITED、邀请有效期未到的审稿人被当作不存在。触发条件：编辑部同时邀请 A/B/C，A 接受后任务转 REVIEWING，B 接受后超时，C 的邀请仍在有效期内；此时 accepted=[A(SUBMITTED),B(OVERDUE)]，settled 与 accepted 数量相等，命令向全部编辑发送『任务审稿人已全部到期，请选择处理方式』通知（161-181行），且内容『已提交 X 份 / 共 Y 位』漏计 C。后果：编辑据此调用 handle_overdue action=rollback 将任务回退 PENDING，而 C 的邀请仍有效；C 随后接受邀请时 accept_invitation 只在 task.status=='ASSIGNED' 时转 REVIEWING（views.py:138-141），任务滞留 PENDING；C 提交意见时 check_and_transition_on_submit 因任务不在 REVIEWING 直接返回（state_machine.py:124-125），意见入库但任务永久卡在待分配。PRD 对三选一的触发定义是『其余全部超时』，未到期的有效邀请不属于超时。",
+    "evidence": "process_scheduled.py:153-155 `assignments = [a for a in task.assignments.all() if a.assignment_status != 'REJECTED']; accepted = [a for a in assignments if a.assignment_status in ('ACCEPTED','REVIEWING','SUBMITTED','OVERDUE')]`（INVITED 未纳入分母）；158-159行 `if len(settled) != len(accepted): continue`；PRD 276/479行触发条件为『其余全部超时』",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 154,
+    "severity": "严重",
+    "title": "三选一『全部到期』判定忽略仍存活的 INVITED 邀请，导致提前误发三选一通知并可能引发任务状态错乱",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "当 REVIEWING 任务的所有已接受审稿人全部 OVERDUE 且无一 SUBMITTED 时（PRD §2.6 边界条件 478行『全部审稿人拒绝或超时（无可提交意见）』、§3.4 275行），PRD 明确要求『任务自动回退至待分配状态』，技术实施方案状态流转表（255行）也将 REVIEWING→PENDING（全部超时且无可提交意见）的执行者标为 SYSTEM。但 _mark_overdue 对该场景只发送三选一通知（161-181行），命令头注释（14-15行）自述『只做检测与通知，不做状态机代决』；全代码库中 REVIEWING→PENDING 只能由编辑经 handle_overdue API（views.py:207-209，reason 为『编辑选择回退』）触发，SYSTEM 路径无任何调用点。后果：全部超时且零意见的任务无限期滞留 REVIEWING，完全依赖编辑手动处理；且此时通知内容仍提供『action=summarize 强制汇总』选项（178-179行），编辑可在 0 份已提交意见的情况下走强制汇总路径。决策日志#011 第4项仅备案机制降级，未备案取消该自动转换。",
+    "evidence": "process_scheduled.py:14-15『本命令只做检测与通知，不做状态机代决』；151-182行仅发通知无转换；grep 全库 REVIEWING→PENDING 仅 state_machine.py:180（handle_all_overdue，EDITER reason）与 process_scheduled.py:103（ASSIGNED→PENDING）两个调用点；PRD 478行『任务自动回退至\"待分配\"状态』；技术方案 255行 `REVIEWING→PENDING 全部超时且无可提交意见 SYSTEM`",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 151,
+    "severity": "严重",
+    "title": "PRD 要求的『全部超时且无可提交意见→系统自动回退 PENDING』转换从未被自动执行，任务无限期滞留 REVIEWING",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "send_task_created 标题为 f'【稿件受理】您的稿件《{task.title}》已进入审稿流程'（固定19字+标题），send_invitation 为 f'【审稿邀请】{task.title}'（固定6字+标题，115行），send_decide 为 f'【审稿结果】您的稿件《{task.title}》审稿已完成'（固定17字+标题，267行）。ReviewTask.title 允许最长200字（tasks/models.py:21，PRD §2.4 输入定义也规定『标题≤200字』），而 Notification.title 是 max_length=200 的 CharField（notifications/models.py:24），objects.create 不经 full_clean 直接 INSERT。触发条件：稿件标题≥182字（任务创建）/≥195字（分配审稿人）/≥184字（录入终审决策）——均为 PRD 合法输入。后果：PostgreSQL varchar(200) 溢出抛 DataError，且这三个调用点都位于业务事务内（views.py:52、101、243），整个业务操作回滚：编辑创建稿件、分配审稿人、录入终审决策直接 500 失败。",
+    "evidence": "services.py:87 `title = f'【稿件受理】您的稿件《{task.title}》已进入审稿流程'`；services.py:115/267 同类拼接；notifications/models.py:24 `title = models.CharField('通知标题', max_length=200)`；tasks/models.py:21 `title = models.CharField('稿件标题', max_length=200)`；views.py:46-52 事务内调用",
+    "file": "dev/backend/apps/notifications/services.py",
+    "line": 87,
+    "severity": "严重",
+    "title": "通知标题内嵌最长200字的稿件标题且未截断，Notification.title varchar(200) 溢出使 PRD 合法输入直接打崩建稿/分配/决策接口",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "_create_notification 捕获异常后记录日志并 re-raise（services.py:57-62）。经 _notify_multiple 的批量路径（send_accept/send_reject/send_submit/send_summarize/send_overdue）有逐条 try/except 兜底且内层 atomic 构成 savepoint，单条失败回滚到保存点后继续循环，不会破坏调用方外层事务——该路径是安全的。但四个单收件人方法 send_task_created、send_invitation、send_decide 直接调用 _create_notification，异常原样上抛：views.py:52（任务创建事务内）、views.py:101（分配审稿人事务内）、views.py:243（终审决策事务内）均无捕获，通知层任何异常（如上条标题溢出 DataError、数据库抖动）都会把已成功的业务写操作一并回滚，业务接口 500。代码库自身已有相反范式：forms/views.py:432-436 注释『事务外发送，避免事务回滚影响通知』并以 try/except 包裹 send_submit，summaries/services.py:526-530 同样处理，tasks/views.py 未遵循。另外 process_scheduled.py:131 的 send_remind 无 try/except 且不在 atomic 内，单条提醒创建失败会中断整个命令，导致当轮 _mark_overdue 与 _notify_editor_in_chief 阶段不再执行。",
+    "evidence": "services.py:62 `raise`；services.py:68-73 仅 _notify_multiple 有 except；views.py:46-52/86-108/234-243 事务内直接调用；对照 forms/views.py:432-436 `# 通知编辑部（事务外发送，避免事务回滚影响通知） try: ... except`；process_scheduled.py:131 无保护调用",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 52,
+    "severity": "一般",
+    "title": "单收件人通知方法在业务事务内调用且异常未捕获，通知层故障会回滚整个业务操作；定时命令中则会中断全部后续阶段",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "today = timezone.now().date()（40行）在 USE_TZ=True 下取的是 UTC 日期，而提醒去重（127行、164行）的 created_at__date 查询按 settings.TIME_ZONE='Asia/Shanghai'（settings.py:115-117）解释时间戳。上海时间 00:00–08:00（=UTC 前一日 16:00–24:00）窗口内运行的命令，today 等于本地日期的前一天：days_left=(deadline-today) 比真实值大 1（118行），7/3/1 天提醒会在实际剩 6/2/0 天时触发且通知内容标注错误的剩余天数（deadline 当天会收到『1 天后到期』）；邀请过期与超时标记判断（71行、140行）整体后移一天；去重比较的『当日』实为『UTC 当日』，与通知记录的上海日期错位。命令 docstring 规定 0 8 * * *（恰好 08:00 上海=00:00 UTC，日期一致，侥幸避开），但 dev/README.md:90-93 给出的示例 cron 是 */30 * * * *（每30分钟），且任何被安排在 00:00–08:00 本地窗口、或白天时段缺失执行的操作配置（如常见的 0 2 * * *）都会使四个阶段全部按昨日日期运行。",
+    "evidence": "process_scheduled.py:40 `today = timezone.now().date()`；:118 `days_left = (assignment.deadline - today).days`；:127/164 `created_at__date=today`；settings.py:115-117 `TIME_ZONE='Asia/Shanghai'; USE_TZ=True`；dev/README.md:93 `*/30 * * * * ... manage.py process_scheduled`",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 40,
+    "severity": "一般",
+    "title": "today 用 UTC 日期（timezone.now().date()）而 created_at__date 查询按 Asia/Shanghai 解释，两套日期语义在同一命令内混用",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "_mark_overdue 的过滤条件只有 assignment_status__in=['ACCEPTED','REVIEWING'] 与 deadline__lt=today（138-141行），不看 task.status。PRD §2.6『编辑部强制提前汇总』（480行）规定未提交的审稿人应标记为『未提交-已汇总』，但 force_summarize 接口（views.py:180-193）只做 REVIEWING→SUBMITTED 状态转换、不改动任何 assignment，未提交者保持 ACCEPTED。触发条件：编辑在部分人未提交时强制汇总（或汇总/决策后），残留 ACCEPTED 审稿人的个人截止日过后，命令将其标为 OVERDUE 并调用 send_overdue（148行）向该审稿人和全部编辑发送『审稿任务已超时……审稿人请尽快提交意见，编辑部可考虑重新分配』的通知——此时任务可能已是 SUMMARIZED 乃至 DECIDED 终态，审稿人已无法再参与该轮审稿，编辑部收到的『重新分配』指引也与终态任务矛盾。",
+    "evidence": "process_scheduled.py:138-141 `ReviewAssignment.objects.filter(assignment_status__in=['ACCEPTED','REVIEWING'], deadline__lt=today)`（无 task.status 条件）；views.py:190-192 force_summarize 仅 execute_transition 不改 assignment；PRD 480行『未提交的审稿人标记为\"未提交-已汇总\"』",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 138,
+    "severity": "一般",
+    "title": "超时标记仅按分配状态+截止日期过滤、不校验任务状态，已汇总/已决策任务中残留的 ACCEPTED 审稿人被误标 OVERDUE 并收到误导性催办通知",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "validate_transition 对 REVIEWING→PENDING 的守卫（state_machine.py:72-79）：`accepted = task.assignments.filter(assignment_status__in=['ACCEPTED','OVERDUE'])` 之后又 `submitted = accepted.filter(assignment_status='SUBMITTED').count()`——在已限定 ACCEPTED/OVERDUE 的查询集上再过滤 SUBMITTED 恒为空集，submitted 永远等于 0，『已有审稿人提交意见，回退需编辑明确选择』的拦截（76-79行）在任何输入下都不会触发。同时 _expire_invitations 的回退判定（process_scheduled.py:93-105）基于 prefetch_related 的无锁快照：任务列表按 status='ASSIGNED' 查出后逐个处理，执行 execute_transition 时才重新取行锁（state_machine.py:91），但校验对 REVIEWING→PENDING 没有『无 ACCEPTED 审稿人』的前置检查。触发条件：命令遍历到某 ASSIGNED 任务前的一瞬间，某审稿人接受邀请使任务转为 REVIEWING；回退仍会执行（REVIEWING→PENDING 在合法转换表中，死代码守卫放行）。后果：已有 ACCEPTED 审稿人的任务被系统回退为 PENDING，该审稿人随后提交意见时 check_and_transition_on_submit 因任务不在 REVIEWING 提前返回，任务滞留待分配。",
+    "evidence": "state_machine.py:74-75 `accepted = task.assignments.filter(assignment_status__in=['ACCEPTED', 'OVERDUE']); submitted = accepted.filter(assignment_status='SUBMITTED').count()`（恒为0）；process_scheduled.py:93-105 基于 `filter(status='ASSIGNED').prefetch_related('assignments')` 的快照判断 alive/accepted 后直接 execute_transition",
+    "file": "dev/backend/apps/tasks/state_machine.py",
+    "line": 74,
+    "severity": "一般",
+    "title": "REVIEWING→PENDING 的『已有提交意见』守卫校验是死代码，且回退判定基于无锁预取数据：并发下有审稿人刚接受邀请的任务仍会被系统回退 PENDING",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §3.6 边界条件（770行）规定『草稿超时：草稿保存超过30天未提交——系统通知审稿人，草稿保留但标记\"过期\"，审稿人可继续编辑或放弃』。全后端无任何实现：唯一的定时命令 process_scheduled 的 handle() 仅调用 _expire_invitations/_send_deadline_reminders/_mark_overdue/_notify_editor_in_chief 四个阶段（50-53行），grep 全 apps 目录无『30天/days=30』相关逻辑，也无草稿过期状态标记。超过30天的草稿不会有任何系统通知，草稿也不会被标记过期，PRD 边界条件整体落空（前端亦无法产生站内 Notification 记录）。决策日志#011 未备案裁剪该行为。",
+    "evidence": "process_scheduled.py:50-53 四个阶段调用中无草稿相关逻辑；`grep -rn '30天|days=30' dev/backend/apps` 无结果；PRD 770行『草稿超时｜草稿保存超过30天未提交｜系统通知审稿人，草稿保留但标记\"过期\"』",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 50,
+    "severity": "一般",
+    "title": "PRD 要求的『草稿保存超过30天未提交→系统通知审稿人并标记过期』定时逻辑完全未实现",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD（1307行『第二阶段审核超时48小时未处理时，系统自动通知编辑部提醒审核』、1476行匿名化审核超时场景）与技术实施方案 T-52（956行『48小时超时提醒通知』）均要求知识库第二阶段人工审核（AnonymizationStatus=PENDING_REVIEW）停留48小时未处理时自动通知编辑部。process_scheduled 只覆盖任务域四阶段（文件头注释 8-9行），knowledge 应用内也无任何超时检测或 NotificationService 调用（grep knowledge 目录仅 PENDING_REVIEW 状态枚举引用，无 48 小时/timedelta(hours=48) 逻辑）。决策日志#011 第4项备案的『四类定时逻辑』不含知识库审核提醒，该 PRD/T-52 要求的定时通知无任何实现载体。",
+    "evidence": "process_scheduled.py:1-16 文档字符串仅列任务域四项；`grep -rn 'hours=48|48小时' dev/backend/apps` 仅命中 process_scheduled.py 自身；knowledge/services.py、views.py 无超时通知逻辑；PRD 1307/1476行、技术方案 956行 T-52『48小时超时提醒通知』",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 187,
+    "severity": "一般",
+    "title": "知识库第二阶段人工审核 48 小时超时自动提醒编辑部（PRD/T-52）未实现，平台唯一的定时命令无该阶段",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "PRD §2.4 输出定义表（338行）：『超时预警｜编辑部｜通知+看板高亮｜截止前3天/1天/超时』。实现的 _send_deadline_reminders 只向审稿人发送 7/3/1 天提醒（115行 filter 后逐个发给 assignment.reviewer，131行 send_remind），编辑部侧仅在超时之后经 send_overdue（148行）收到通知；截止前3天/1天 editors 不收到任何站内预警。AC-T-08 与技术方案 T-19 的措辞（『截止前7/3/1天提醒（给审稿人）…超时后通知编辑部』）与 PRD 输出定义表存在文档间差异，故列为低级别：按 PRD 输出定义衡量，编辑部的事前预警通知通道缺失，仅剩看板超时筛选（views.py:264-267，且只覆盖已超时不含3/1天预警）。",
+    "evidence": "process_scheduled.py:113-131 提醒仅发 reviewer（send_remind 内 user=reviewer，services.py:310-315）；PRD 338行『超时预警｜编辑部｜通知+看板高亮｜截止前3天/1天/超时』；对照 AC-T-08『截止前7/3/1天自动提醒审稿人；超时后通知编辑部』",
+    "file": "dev/backend/apps/tasks/management/commands/process_scheduled.py",
+    "line": 112,
+    "severity": "建议",
+    "title": "PRD 输出定义要求编辑部在截止前3天/1天收到超时预警通知，实现中编辑部只有超时后通知，事前预警缺失",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "apps/tasks/tests.py 仅包含 StateMachineValidationTests 与 ConcurrentSubmitTests 两类（状态机校验、并发提交），对 process_scheduled 的四个阶段——过期判断边界（invitation_expiry/deadline 恰为今天）、7/3/1 天提醒触发与去重、三选一判定、回退条件（含仍存活 INVITED 的场景）、48小时主编通知——没有任何测试用例。该命令承载 T-19 全部定时逻辑且按 dev/README 以 cron 高频调度，上述边界与判定分支的正确性完全靠人工冒烟，本轮评审发现的多个判定缺陷（存活邀请被忽略、48小时触发条件偏离等）均属无测试覆盖区域。决策日志#011 自述『补 36 个单元/并发测试并完成全链路冒烟』，但定时命令零覆盖。",
+    "evidence": "`grep -n 'process_scheduled|_expire|_mark_overdue|_send_deadline|_notify_editor' apps/tasks/tests.py` 无任何命中；tests.py:44-219 仅有 StateMachineValidationTests/ConcurrentSubmitTests",
+    "file": "dev/backend/apps/tasks/tests.py",
+    "line": 44,
+    "severity": "建议",
+    "title": "process_scheduled 定时命令的四个阶段（含全部边界条件与去重逻辑）零测试覆盖",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   }
+  ]
+ },
+ {
+  "dimension": "frontend",
+  "findings": [
+   {
+    "description": "ReviewForm.vue confirmSubmit 调 formApi.submit({task_id, scores, comments, recommendation, overall_comment, suggestions})，saveDraft 及每 60 秒自动保存发送同构数据。但后端 ReviewOpinionSubmitSerializer/ReviewOpinionDraftSerializer 要求 dimension_scores 为 [{dimensionId, score, comment}] 数组、recommendation 枚举为 ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT、修改建议字段名为 revision_suggestions 且为数组。前端发送的 scores/comments 是对象、recommendation 值为 MINOR_REVISE/MAJOR_REVISE、suggestions 是字符串，后端必填的 dimension_scores 完全缺失。触发条件：审稿人填写完整表单后点击提交（或自动保存触发）。后果：提交必返回 400（dimension_scores 必填 + recommendation 非法枚举），核心审稿流程完全不可用；自动保存每 60 秒弹出一次「请求参数错误」错误提示。草稿回填同样失效（读取 draft.scores/draft.comments，而后端返回 dimension_scores/revision_suggestions）。",
+    "evidence": "前端 ReviewForm.vue:294-301 提交 {scores, comments, recommendation, overall_comment, suggestions}；后端 apps/forms/serializers.py:127-141 ReviewOpinionSubmitSerializer 定义 dimension_scores=ListField(DictField)（必填）、recommendation=ChoiceField(choices=ReviewOpinion.Recommendation.choices)（ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT）、revision_suggestions=ListField。apps/forms/models.py:30-34 Recommendation 枚举为 MINOR_REVISION/MAJOR_REVISION。PRD §6.2.5 line1670 同样规定 ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT。",
+    "file": "dev/frontend/src/views/review/ReviewForm.vue",
+    "line": 294,
+    "severity": "致命",
+    "title": "审稿意见提交/草稿的请求体字段名、结构与推荐枚举值和后端完全不一致，提交必 400",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewForm.vue 从 formApi.getForm 拿到 formRes.dimensions 后，模板用 dim.code 作为 key、dim.name 作为维度名、dim.guideline 作为评分指引提示，评分/评语绑定 formData.scores[dim.code]/formData.comments[dim.code]。后端维度配置的实际键是 dimensionId/dimensionName/description/minWords（系统预设四维模板与 FormService 校验均使用这套键）。触发条件：任何审稿人打开审稿工作台。后果：四个维度块的标题全部渲染为「1. undefined」，指引 tooltip 永不出现；由于 dim.code 均为 undefined，四个维度的评分和评语全部绑定到同一个 undefined 键上——给任一维度打分/写评语会同步覆盖显示到所有维度；后端 FormService.validate_opinion 按 dimensionId 校验维度完整性，即使提交参数名修好，此表单也无法产生合法数据。AI 审稿回填按 ds.dimensionId（D1-D4）写入 formData.scores，与渲染绑定的 undefined 键互不相交，AI 结果在表单上不可见。",
+    "evidence": "ReviewForm.vue:44 `v-for=\"(dim, index) in dimensions\" :key=\"dim.code\"`、47 行 dim.name、48 行 dim.guideline、58/71 行 formData.scores[dim.code]；后端 apps/tasks/views.py:368-372 预设模板 dimensions=[{'dimensionId':'D1','dimensionName':'研究意义','description':...,'minWords':50},...]；apps/forms/services.py:106/112 按 dim.get('dimensionId') 校验。",
+    "file": "dev/frontend/src/views/review/ReviewForm.vue",
+    "line": 44,
+    "severity": "致命",
+    "title": "审稿表单按 dim.code/dim.name/dim.guideline 渲染维度，后端维度配置键为 dimensionId/dimensionName/description，表单渲染与数据绑定全部落空",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TaskAssign.vue confirmAssign 调 taskApi.assignReviewers(taskId, {reviewer_ids: selectedReviewers.map(r => r.id), deadline})。后端 assign_reviewers 读取 request.data.get('reviewer_user_ids')，取不到即返回 400「请至少选择1位审稿人」；且 UserSerializer 返回的主键字段是 user_id 而非 id，前端 r.id 为 undefined。触发条件：编辑部选中审稿人点击「确认分配」。后果：分配审稿人功能 100% 失败（先因参数名取不到列表 400；即便参数名对，值也是 [null] 匹配不到用户）。分配是整个状态机的起点（PENDING→ASSIGNED），该环节断裂导致后续接受邀请、审稿、汇总、决策全链路无法从 UI 走通。另外搜索审稿人时发送 discipline 参数，后端 reviewers action 读取的是 subject，学科筛选静默失效。",
+    "evidence": "前端 TaskAssign.vue:318-321 `reviewer_ids: selectedReviewers.value.map(r => r.id)`；后端 apps/tasks/views.py:72 `reviewer_ids = request.data.get('reviewer_user_ids', [])`、74 行空列表即 400；apps/users/serializers.py:11 fields=['user_id','name','email','roles',...] 无 id 字段；apps/users/views.py:103 读取 subject 参数。",
+    "file": "dev/frontend/src/views/tasks/TaskAssign.vue",
+    "line": 318,
+    "severity": "致命",
+    "title": "分配审稿人请求体键名与审稿人 ID 字段双双错误：发 reviewer_ids/r.id，后端要 reviewer_user_ids/user_id，分配必 400",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TaskCreate.vue 表单字段为 {title, discipline, abstract, file_id, author_email, template_id, deadline}，直接以 form 整体 POST /api/tasks/。后端 ReviewTaskCreateSerializer 要求字段 title/abstract/keywords/subject_area/manuscript_type/manuscript_file/review_mode/expected_reviewer_count/deadline/template_id/author_user_id。对照：前端发 discipline（后端无此字段，subject_area 缺失）、file_id（后端要 manuscript_file）、author_email（后端要 author_user_id 外键），模板下拉用 t.id/t.name 渲染选项（后端 TemplateSerializer 返回 template_id/template_name），所有选项 value 均为 undefined，template_id 无法被有效选中；关键词输入框、稿件类型、审稿模式（单盲/双盲）、期望审稿人数等 PRD 必填项在表单中根本不存在。abstract 标注「选填」但发送空字符串，后端 TextField 无 blank=True 也会 400。触发条件：编辑部填写表单点击「创建任务」。后果：创建任务必 400（subject_area/manuscript_type/manuscript_file/review_mode/author_user_id/template_id 均缺失）；即使创建成功，跳转 /tasks/${res.id} 也因后端返回 task_id 而落到 /tasks/undefined。",
+    "evidence": "前端 TaskCreate.vue:114-122 form 字段、181 行 taskApi.create(form)、72-73 行 `:key=\"t.id\"`/`:value=\"t.id\"`、183 行 router.push(`/tasks/${res.id}`)；后端 apps/tasks/serializers.py:63-71 字段清单；PRD §6.2.2 ReviewTask 实体（1593-1608 行）规定 keywords 必填 3-10 个、subjectArea/manuscriptType/reviewMode/expectedReviewerCount 必填；PRD 356-362 行创建流程含选择审稿模式、设置期望审稿人数量。",
+    "file": "dev/frontend/src/views/tasks/TaskCreate.vue",
+    "line": 114,
+    "severity": "致命",
+    "title": "创建任务表单字段名与后端序列化器全面不匹配且缺 PRD 必填项，任务创建必 400",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TaskDecision.vue handleSubmit 调 taskApi.makeDecision(taskId, {decision, editor_note})。后端 make_decision 读取 request.data.get('notes')，notes 为空即返回 400「决策结果和说明必填」；且后端要求 len(notes) >= 100 字，前端校验规则（175-184 行）只校验必填与 maxlength 2000，没有 100 字下限的前置校验。触发条件：编辑在 SUMMARIZED 状态录入终审决策并提交。后果：终审决策功能从 UI 100% 失败（editor_note 键名后端不识别，notes 恒为空字符串 → 400）；即使键名正确，不足 100 字也会 400 且前端未拦截。终审决策是状态机 SUMMARIZED→DECIDED 的唯一入口，导致任务永远停留在已汇总状态。",
+    "evidence": "前端 TaskDecision.vue:263-266 `await taskApi.makeDecision(taskId, { decision: form.decision, editor_note: editorNote })`；后端 apps/tasks/views.py:225-229 `notes = request.data.get('notes', '')`、`if not decision or not notes: return 400`、`if len(notes) < 100: return 400 '决策说明至少100字'`。PRD §6.2.2 规定 decisionNotes ≥100字符。",
+    "file": "dev/frontend/src/views/tasks/TaskDecision.vue",
+    "line": 263,
+    "severity": "致命",
+    "title": "终审决策提交发 editor_note，后端读 notes 并要求 ≥100 字，前端既没对上字段名也没校验字数下限，提交必 400",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "MyTasks.vue fetchTasks 调 taskApi.myTasks 后，卡片渲染与 Tab 过滤全部基于 task.id/task.title/task.status/task.task_number 等任务级字段，接受/拒绝/进入审稿按钮用 task.id 拼接 URL。后端 my_tasks 返回的是 ReviewAssignmentSerializer 序列化的分配记录数组，字段为 assignment_id/task(任务ID字符串)/task_title/reviewer_name/assignment_status/deadline 等，不存在 id/title/status。触发条件：审稿人登录后打开「我的审稿任务」。后果：卡片标题为空、状态标签为空；三个 Tab 的过滤条件（t.status === 'ASSIGNED' 等）在 undefined 上永远不成立，页面恒显示「暂无任务」——即使审稿人有多条待响应邀请；「接受邀请」会 POST /api/tasks/undefined/accept_invitation/ 得到 404，审稿人无法接受或拒绝邀请，也无法进入审稿工作台。",
+    "evidence": "前端 MyTasks.vue:189 `allTasks.value.filter((t) => t.status === 'ASSIGNED')`、240 行 acceptInvitation(task.id)、56-57 行 task.title/task.task_number；后端 apps/tasks/views.py:282-300 my_tasks 返回 `{'count':…, 'results': ReviewAssignmentSerializer(assignments, many=True).data}`；ReviewAssignmentSerializer 字段（apps/tasks/serializers.py:15-29）为 assignment_id/task/task_title/assignment_status 等。",
+    "file": "dev/frontend/src/views/tasks/MyTasks.vue",
+    "line": 189,
+    "severity": "致命",
+    "title": "我的审稿任务页按任务字段解析分配记录数据，t.status/t.id 全为 undefined，页面恒为空且接受/拒绝/进入审稿全部 404",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "KnowledgeReview.vue handleApprove 调 knowledgeApi.reviewAnonymization(currentItem.id, {action: 'approve', note, segment_decisions})，handleReject 发 {action: 'reject', note}。后端 AnonymizationReviewSerializer 要求 decision ∈ APPROVED/REJECTED/PERMANENTLY_EXCLUDED、备注字段为 notes，segment_decisions 概念后端不存在。触发条件：编辑在匿名化审核队列点击「审核通过」或「退回修改」。后果：请求必 400（decision 必填），PRD V1.1 C-03 强调的两阶段匿名化人工审核功能完全不可用；由于知识库检索只返回 APPROVED 条目，审核断裂进一步导致知识库永远为空。另外 currentItem.id 本身是 undefined（后端返回 knowledge_id），还会先 404。",
+    "evidence": "前端 KnowledgeReview.vue:157-164 `{action: 'approve', note: reviewNote.value, segment_decisions:…}`、180-183 行 `{action: 'reject', note:…}`；后端 apps/knowledge/serializers.py:80-97 AnonymizationReviewSerializer：decision=ChoiceField(choices=['APPROVED','REJECTED','PERMANENTLY_EXCLUDED'])、notes=CharField；apps/knowledge/views.py:155-191 review_anonymization 直接用该序列化器校验。",
+    "file": "dev/frontend/src/views/knowledge/KnowledgeReview.vue",
+    "line": 157,
+    "severity": "严重",
+    "title": "匿名化审核提交发 action/note/segment_decisions，后端要 decision(APPROVED等)/notes，审核操作必 400，知识库入库流程断裂",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "NotificationList.vue 用 :key=\"item.id\"、点击未读通知时 markRead({notification_ids: [item.id]})、图标映射用 item.notification_type。后端 NotificationSerializer 返回的主键字段是 notification_id，类型字段是 type，且 Type 枚举为 TASK_CREATED/INVITATION/ACCEPT/REJECT/SUBMIT/SUMMARIZE/DECIDE/REMIND/OVERDUE。触发条件：用户打开通知抽屉点击任一条未读通知。后果：notification_ids: [undefined] 序列化为 [null]，后端 MarkReadSerializer 的 IntegerField 校验失败返回 400，通知永远无法标记已读、红点数不减，且每次点击都弹出「请求参数错误」；item.notification_type 为 undefined 加上映射键不匹配（ASSIGN/DECISION/SYSTEM 在后端不存在，INVITATION/DECIDE/REMIND 在前端映射缺失），所有通知图标固定显示默认铃铛与灰色。另 MainLayout 每 30 秒轮询 unread_count，已读不可用导致角标持续残留。",
+    "evidence": "前端 NotificationList.vue:18/101 item.id、24-25 行 getIconName(item.notification_type)、54-66 行映射键 ASSIGN/ACCEPT/REJECT/SUBMIT/SUMMARIZE/DECISION/OVERDUE/SYSTEM；后端 apps/notifications/serializers.py fields=['notification_id',…,'type',…]、MarkReadSerializer notification_ids=ListField(IntegerField)；apps/notifications/models.py:8-18 Type 枚举为 TASK_CREATED/INVITATION/…/DECIDE/REMIND/OVERDUE。",
+    "file": "dev/frontend/src/components/NotificationList.vue",
+    "line": 101,
+    "severity": "严重",
+    "title": "通知组件用 item.id/item.notification_type 读数据，后端主键是 notification_id、类型字段是 type 且枚举键不同：点击已读必 400，图标恒为默认",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "Dashboard.vue fetchDashboard（EDITOR 分支）与 TaskList.vue fetchStats 都把 taskApi.dashboard() 的返回值直接当作统计对象使用，读 stats.pending/reviewing/submitted/decided。后端 dashboard action 返回的是 paginate_queryset 后的标准分页结构 {count, next, previous, results:[任务列表]}，不含任何状态计数字段。触发条件：编辑部登录进入工作台概览或任务看板。后果：编辑端 8 张统计卡片（待分配/审稿中/待汇总/已决策等）恒显示 0，违反 PRD §294「统计概览：显示当前在审稿件数、待分配稿件数、超时任务数等关键指标」。REVIEWER/AUTHOR 分支更直接硬编码 assigned:0/reviewing:0/submitted:0（my_tasks/my_articles 响应中也没有这些统计字段）。另后端分页类未开启 page_size_query_param，前端传 page_size:50/5/100 均被忽略，通知「查看全部」实际只展示 20 条且无翻页控件。",
+    "evidence": "前端 Dashboard.vue:149-158 `const res = await taskApi.dashboard(); stats.value = res`（99-118 行读 stats.value.pending 等）、TaskList.vue:139-140 同样写法；后端 apps/tasks/views.py:272-277 dashboard 返回 get_paginated_response(ReviewTaskSerializer(page, many=True).data)；review_platform/settings.py:138-139 仅配置 PageNumberPagination/PAGE_SIZE=20。",
+    "file": "dev/frontend/src/views/Dashboard.vue",
+    "line": 149,
+    "severity": "严重",
+    "title": "工作台/任务看板的统计卡片读 res.pending 等键，而后端 dashboard 返回分页任务列表 {count,results}，所有统计恒为 0",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewTaskSerializer 返回的主键是 task_id（无 id 字段）。TaskList.vue 操作列用 row.id 跳 /tasks/${row.id}、/opinions/${row.id}、/refs/${row.id}、/summaries/${row.id}；TaskDetail.vue 操作栏用 task.id 跳分配/决策/意见/汇总/参考文献；MyArticles.vue goToProgress 用 row.id 跳 /articles/${row.id}/progress；TaskCreate.vue 创建成功后跳 /tasks/${res.id}。触发条件：编辑部在看板点击任何行操作按钮，或作者点击「查看进度」，或完成任务创建。后果：全部导航到 /xxx/undefined，随后 taskApi.retrieve(undefined) 请求 GET /api/tasks/undefined/ 返回 404「请求的资源不存在」，详情页/进度页/汇总页/意见页从列表入口一律打不开。",
+    "evidence": "前端 TaskList.vue:64-72 五处 `${row.id}`、TaskDetail.vue:31/37/40/43/46 `${task.id}`、MyArticles.vue:169 `${row.id}`、TaskCreate.vue:183 `${res.id}`；后端 apps/tasks/serializers.py:33-51 ReviewTaskSerializer fields 以 'task_id' 开头，无 id；apps/tasks/models.py:15 task_id 为主键。",
+    "file": "dev/frontend/src/views/tasks/TaskList.vue",
+    "line": 64,
+    "severity": "严重",
+    "title": "全站任务导航使用 row.id/task.id，后端主键字段是 task_id，详情/分配/意见/汇总/进度跳转全部落到 /undefined 后 404",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "SummaryList.vue 表格列绑定 task_title/task_number/distribution/matched_rule/final_recommendation/created_at；后端列表用 SummaryReportBriefSerializer，字段仅 report_id/task_id/system_recommendation/generated_at。生成汇总对话框的候选任务来自 taskApi.list({status:'SUBMITTED'})——后端任务列表 action 无任何 status 过滤，返回全部任务；下拉选项用 t.id/t.task_number 渲染（后端为 task_id），label 显示「undefined - 标题」且 value 为 undefined。触发条件：编辑部打开汇总报告页并尝试生成报告。后果：列表所有列空白；生成对话框把 PENDING/DECIDED 等任意状态任务都列为「需为已提交状态」候选；选中后 POST {task_id: undefined}，axios 丢弃 undefined 键，后端读到空 body 返回 400「请提供task_id」，即使状态凑巧为 SUBMITTED 生成也会失败。",
+    "evidence": "前端 SummaryList.vue:12-45 列绑定、66-69 行 `:label=\"${t.task_number} - ${t.title}\"`/`:value=\"t.id\"`、130 行 taskApi.list({status:'SUBMITTED'})；后端 apps/summaries/serializers.py:40-53 Brief 字段、apps/summaries/views.py:97-99 `task_id = request.data.get('task_id'); if not task_id: 400`；apps/tasks/views.py 无 list 重写（ReviewTaskViewSet 仅 get_queryset 角色过滤，query 参数被忽略）。",
+    "file": "dev/frontend/src/views/summaries/SummaryList.vue",
+    "line": 12,
+    "severity": "严重",
+    "title": "汇总报告列表按 task_title/task_number/distribution/matched_rule/final_recommendation 取值，后端简要序列化器只有 report_id/task_id/system_recommendation/generated_at，整表空白；生成汇总下拉取全量任务且值为 undefined，生成必 400",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "SummaryDetail.vue 读取 report.task_number、report.reviewer_count、report.created_at、report.matched_rule、report.final_recommendation、report.rule_explanation、report.dimension_scores（按维度分组的对象）、report.distribution、report.conflicts、report.consensus、report.opinions_summary。后端 SummaryReportSerializer 实际字段为 task_id、task_title、generated_at、system_recommendation（JSON: {distribution, matchedRuleId, conclusion}）、dimension_comparison（列表）、recommendation_distribution、conflict_points、consensus_points、opinion_ids、overall_comments 等。触发条件：编辑或经任务详情跳转打开任一汇总报告详情页。后果：稿件信息描述行、规则匹配卡片、推荐分布饼图（echarts data 为空）、维度评分雷达图与明细表、分歧/一致点分析、审稿人综合评语全部渲染为空，页面只剩骨架。",
+    "evidence": "前端 SummaryDetail.vue:22-26 描述行、43-55 matched_rule/final_recommendation/rule_explanation、158-164 dimension_scores、169 行 report.distribution、86/102 行 report.conflicts/report.consensus、114 行 report.opinions_summary；后端 apps/summaries/serializers.py:18-37 fields=['report_id','task_id','task_title','task_status','opinion_ids','dimension_comparison','recommendation_distribution','conflict_points','consensus_points','revision_suggestions_summary','overall_comments','system_recommendation',…]；apps/summaries/models.py:10-24 无 average_score/summary_text 等字段（TaskDecision.vue 引用的这两个字段同样不存在）。",
+    "file": "dev/frontend/src/views/summaries/SummaryDetail.vue",
+    "line": 22,
+    "severity": "严重",
+    "title": "汇总报告详情页所有数据区读取的字段（matched_rule/final_recommendation/dimension_scores/distribution/conflicts/consensus/opinions_summary 等）在后端序列化器中均不存在，页面全空",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TaskDetail.vue 中「强制汇总」按钮的 v-if 条件是 task.status === 'SUBMITTED'。后端 force_summarize 明确要求 task.status == 'REVIEWING'（「仅审稿中状态可强制汇总」），SUBMITTED 状态时返回 400。触发条件：任务进入 SUBMITTED 后点击「强制汇总」，或任务处于 REVIEWING 且编辑想提前汇总。后果：按钮只在会报错的状态下出现——SUBMITTED 时点击必得 400「仅审稿中状态可强制汇总」；真正需要强制汇总的 REVIEWING 状态（部分审稿人未提交、其余超时）反而没有任何入口。按钮显隐与后端状态机约束完全错位。",
+    "evidence": "前端 TaskDetail.vue:34 `<el-button v-if=\"task.status === 'SUBMITTED'\" type=\"warning\" @click=\"handleForceSummarize\">强制汇总</el-button>`；后端 apps/tasks/views.py:181-185 `if task.status != 'REVIEWING': return Response({'error': '仅审稿中状态可强制汇总'}, status=400)`。",
+    "file": "dev/frontend/src/views/tasks/TaskDetail.vue",
+    "line": 34,
+    "severity": "严重",
+    "title": "强制汇总按钮的显隐条件与后端状态机要求相反：SUBMITTED 时显示（后端必拒），REVIEWING 时反而无入口",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "taskApi.handleOverdue 在 api/modules.js:24 定义（POST /tasks/{id}/handle_overdue/，后端支持 action='summarize'|'rollback' 两种选择），但全前端没有任何视图调用它。PRD C-01 规定：REVIEWING 状态下部分已提交其余全部超时时，「系统通知编辑并提供两种选择」（强制汇总 / 回退待分配），S-02 还规定超时 48 小时自动通知主编。触发条件：任务发生全部/部分审稿人超时，编辑收到 OVERDUE 站内通知。后果：编辑在 UI 上没有任何途径执行强制汇总或回退，超时任务永久卡死在 REVIEWING 状态，PRD 要求的异常出口转换（含 REVIEWING→PENDING 回退）无法由人工触发。",
+    "evidence": "前端 grep handleOverdue 仅命中 dev/frontend/src/api/modules.js:24 定义处，views/ 下无调用；后端 apps/tasks/views.py:195-212 handle_overdue 已实现 summarize/rollback 两分支；PRD V1.1 262 行「系统通知编辑并提供两种选择」、AC-T-04 要求覆盖含 REVIEWING→PENDING 的全部异常流转路径。",
+    "file": "dev/frontend/src/api/modules.js",
+    "line": 24,
+    "severity": "严重",
+    "title": "超时处理接口 handle_overdue（编辑选择强制汇总或回退待分配）在前端无任何调用入口，PRD C-01 要求的异常路径无 UI 支撑",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "fileApi.download（GET /files/{id}/download/，后端 FileViewSet.download 已实现文件流下载）在整个前端没有任何视图调用；审稿工作台 ReviewForm.vue 只有评分表单与 AI 辅助，没有稿件 PDF 的下载或预览入口；TaskDetail 也无稿件文件区。触发条件：审稿人进入审稿工作台准备评审。后果：审稿人拿不到待审稿件，PRD §流程2（418 行「进入审稿工作台 → 下载稿件 → 填写审稿表单」）的关键环节缺失，整个审稿动作在 UI 上无从开展。",
+    "evidence": "前端 grep fileApi.download / .download( 仅命中 dev/frontend/src/api/modules.js:52 定义；ReviewForm.vue 模板（1-166 行）无任何 manuscript/PDF 相关元素；后端 apps/files/views.py:100-145 download action 已实现；PRD 410-424 行审稿流程明确包含「下载稿件」。",
+    "file": "dev/frontend/src/api/modules.js",
+    "line": 52,
+    "severity": "严重",
+    "title": "审稿人在界面上无法下载/查看稿件 PDF：fileApi.download 定义后从未被调用，违反 PRD 审稿流程「下载稿件」环节",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TemplateList.vue 列表列用 row.name/row.discipline/row.is_active/row.usage_count，编辑回填用 row.id，启停用 templateApi.toggleStatus(row.id)。后端 TemplateSerializer 返回 template_name/subject_area/status('ACTIVE'|'INACTIVE')/template_id，无 usage_count。保存时发送 {name, discipline, description, dimensions:[{code,name,guideline}]}。触发条件：编辑创建/编辑/启停模板。后果：列表名称、学科列空白，所有模板状态恒显示「停用」（is_active 恒 undefined）；新建模板缺 template_name（后端必填，max_length=100）返回 400，维度对象键后端校验用的是 dimensionId/dimensionName/description/minWords（FormService 按 dimensionId 匹配），code/name/guideline 结构即使存进去也无法被表单校验消费；编辑与启停请求 PATCH/POST /templates/undefined/... 全部 404。PRD S-06 保留的创建/编辑/启停三项 P0 功能从 UI 全部不可用。",
+    "evidence": "前端 TemplateList.vue:12-34 列绑定、106-112 行 editing 字段、143-152 行 row.id/row.name/row.discipline、171-181 行保存 payload {name, discipline, description, dimensions}、193 行 toggleStatus(row.id)；后端 apps/tasks/serializers.py:5-12 TemplateSerializer fields=['template_id','template_name','template_type','subject_area','dimensions','status',…]；apps/tasks/models.py:163-168 template_name 必填、dimensions 注释为 [{dimensionId, dimensionName, description, minWords}]。",
+    "file": "dev/frontend/src/views/templates/TemplateList.vue",
+    "line": 171,
+    "severity": "严重",
+    "title": "模板管理字段全面错位：列表读 name/discipline/is_active/usage_count（后端为 template_name/subject_area/status），新建发 name 键必 400，编辑/启停用 row.id 必 404，状态标签恒显示「停用」",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "KnowledgeSearch.vue 列表项渲染 item.id/item.knowledge_type/item.discipline/item.score/item.title/item.summary/item.created_at，点击调 knowledgeApi.detail(item.id)。后端检索结果用 KnowledgeItemBriefSerializer，字段仅 knowledge_id/subject_area/keywords/tags/final_decision/review_year/review_month；筛选参数前端发 discipline/knowledge_type/min_score，后端支持的是 subject_area/manuscript_type/final_decision/recommendation/score_range；冷启动标识前端读 res.cold_start，后端返回 is_cold_start。触发条件：审稿人/编辑在知识库检索页搜索或点击结果。后果：结果卡片除 tags 外全部空白（标题空、类型显示 undefined、无评分无日期）；学科/知识类型/最低评分三个筛选器静默无效（sort_by 仅 'score' 值被支持，'relevance'/'created_at' 均落到默认排序）；点击任意结果 GET /api/knowledge/undefined/detail/ 返回 404，详情弹窗打不开；冷启动时 PRD S-01 要求的「展示模板评分指引」降级提示永不出现。",
+    "evidence": "前端 KnowledgeSearch.vue:76-88 item.id/item.knowledge_type/item.discipline/item.score/item.title、136-142 行 searchParams{discipline, knowledge_type, min_score, sort_by}、169 行 res.cold_start、181 行 knowledgeApi.detail(item.id)；后端 apps/knowledge/serializers.py:58-77 Brief 字段、apps/knowledge/views.py:39-61 search 支持的查询参数清单、apps/knowledge/services.py:501-508 返回 {'is_cold_start':…}。",
+    "file": "dev/frontend/src/views/knowledge/KnowledgeSearch.vue",
+    "line": 76,
+    "severity": "严重",
+    "title": "知识库检索结果按 id/title/score/knowledge_type/discipline 渲染并点 item.id 查详情，后端简要序列化器只有 knowledge_id/subject_area/keywords/tags 等字段：卡片空白、详情 404、筛选参数无效、冷启动提示失效",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "MainLayout.vue onMounted 中 setInterval(updateUnreadCount, 30000) 启动 30 秒轮询，整个组件没有 onUnmounted 清理。触发条件：用户登录后点击「退出登录」跳转到 /login（MainLayout 卸载）。后果：定时器句柄随闭包存活，继续每 30 秒调用 GET /api/notifications/unread_count/；此时 token 已清除，请求必 401，响应拦截器弹出「登录已过期，请重新登录」并 router.push('/login')。用户停留在登录页时每 30 秒收到一次报错 toast，直到手动刷新页面；同时构成对已登出会话的持续无效请求。",
+    "evidence": "前端 MainLayout.vue:145-149 `onMounted(() => { updateUnreadCount(); setInterval(updateUnreadCount, 30000) })`，文件中无 onUnmounted/clearInterval；api/index.js:29-35 401 分支弹 ElMessage 并清 token 跳登录页。",
+    "file": "dev/frontend/src/layouts/MainLayout.vue",
+    "line": 148,
+    "severity": "一般",
+    "title": "未读数 30 秒轮询的 setInterval 从未清理，登出后仍每 30 秒发起无 token 请求并循环弹出「登录已过期」错误提示",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TaskList.vue fetchList 将 filters 中的 keyword/status/discipline 作为 query 参数发给 GET /api/tasks/。ReviewTaskViewSet 没有 list 重写，get_queryset 只做角色过滤，任何 keyword/status/discipline 查询参数都被直接忽略（DRF 默认 list 不消费 query params）。触发条件：编辑在看板输入标题/编号关键词或选择状态、学科后点击搜索。后果：列表内容纹丝不动，筛选栏与搜索框完全无效，用户以为系统里没有某状态的任务；同时也使前端 TASK_STATUS 中不存在的 ARCHIVED/REJECTED 选项（见枚举问题）无从暴露。",
+    "evidence": "前端 TaskList.vue:126-135 `params = { page, keyword, status, discipline }` 传给 taskApi.list；后端 apps/tasks/views.py:18-32 get_queryset 仅按角色过滤，grep 'def list' 无结果（tasks 视图无 list 方法），后端支持筛选的是 dashboard action（247-268 行）而非列表接口。",
+    "file": "dev/frontend/src/views/tasks/TaskList.vue",
+    "line": 129,
+    "severity": "一般",
+    "title": "任务看板的搜索/状态/学科筛选参数发送到后端后被完全忽略，筛选功能静默失效",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TASK_STATUS 增加了后端状态机不存在的 ARCHIVED（已归档）与 REJECTED（已拒稿），被 TaskList 状态筛选、TaskDetail/ArticleProgress 的判断逻辑引用；ASSIGNMENT_STATUS 前端键为 PENDING/ACCEPTED/REJECTED/EXPIRED，后端 AssignmentStatus 为 INVITED/ACCEPTED/REJECTED/REVIEWING/SUBMITTED/OVERDUE/EXPIRED；RECOMMENDATION 前端用 MINOR_REVISE/MAJOR_REVISE，PRD 与后端均为 MINOR_REVISION/MAJOR_REVISION。触发条件：渲染任何任务状态标签、分配状态标签、推荐意见标签。后果：后端真实返回的分配状态（如 INVITED/REVIEWING/SUBMITTED/OVERDUE）在前端映射中找不到，回退显示原始英文枚举；推荐意见 MINOR_REVISION/MAJOR_REVISION 在 RECOMMENDATION 中查不到，OpinionView/TaskDecision 等处标签显示裸枚举字符串而非「小修/大修」；反向前端发出的 MINOR_REVISE 会被后端 ChoiceField 拒绝（见提交问题）。",
+    "evidence": "前端 utils/status.js:6-15 TASK_STATUS 含 ARCHIVED/REJECTED、33-38 ASSIGNMENT_STATUS 键 PENDING/EXPIRED、18-23 RECOMMENDATION 含 MINOR_REVISE/MAJOR_REVISE；后端 apps/tasks/models.py:7-14 Status 枚举仅 PENDING/ASSIGNED/REVIEWING/SUBMITTED/SUMMARIZED/DECIDED、81-89 AssignmentStatus 为 INVITED/…/OVERDUE/EXPIRED；apps/forms/models.py:30-34 与 PRD line1600/1625/1670 均为 MINOR_REVISION/MAJOR_REVISION 枚举。",
+    "file": "dev/frontend/src/utils/status.js",
+    "line": 6,
+    "severity": "一般",
+    "title": "前端三套状态枚举与后端/PRD 不一致：TASK_STATUS 多出 ARCHIVED/REJECTED，ASSIGNMENT_STATUS 用 PENDING 而非 INVITED 且缺 REVIEWING/SUBMITTED/OVERDUE，RECOMMENDATION 用 MINOR_REVISE 而非 PRD 定义的 MINOR_REVISION",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "审稿人列表表格用 ASSIGNMENT_STATUS[row.status] 渲染状态、row.recommendation 渲染推荐意见，后端 ReviewAssignmentSerializer 返回的是 assignment_status，且不含 recommendation 字段（推荐意见存于 ReviewOpinion）。状态流转时间线用 log.id/log.to_status/log.remark，后端 StateLogSerializer 返回 log_id/to_state/trigger_reason。触发条件：编辑打开任一任务详情。后果：审稿人状态列标签为空（assignment_status 读不到，row.status 为 undefined），推荐意见列恒显示「-」，任务处于哪个分配环节无从判断；状态时间线的目标状态标签为空、备注（trigger_reason）永不显示。",
+    "evidence": "前端 TaskDetail.vue:61 `ASSIGNMENT_STATUS[row.status]?.color`、68 行 row.recommendation、88 行 :key=\"log.id\"、90 行 log.to_status、100 行 log.remark；后端 apps/tasks/serializers.py:24-29 字段 assignment_status（无 status/recommendation）、83-90 StateLogSerializer 字段 log_id/from_state/to_state/trigger_reason。",
+    "file": "dev/frontend/src/views/tasks/TaskDetail.vue",
+    "line": 61,
+    "severity": "一般",
+    "title": "任务详情的审稿人列表与状态时间线字段全部错位：分配状态读 row.status（后端为 assignment_status）、推荐意见列后端不存在、日志读 to_status/remark/operator（后端为 to_state/trigger_reason/operator_name）",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "稿件进度页终审结果卡片读 task.decision/task.decided_at/task.decision_comment，后端 ReviewTaskSerializer 字段为 final_decision/decision_notes（无 decided_at，仅有 updated_at）；审稿进度概览卡 v-if=\"task.total_reviewers\"，后端序列化器无 total_reviewers/submitted_opinions 字段（只有 assignments 嵌套数组）；状态时间线读 log.to_status/from_status/operator/operator_role/remark。触发条件：作者在稿件 DECIDED 后查看进度，或任意时刻打开进度页。后果：终审决定恒显示「-」、决策时间与终审意见永不出现在作者面前（作者无法得知录用结果，违反 PRD 作者流程）；审稿进度概览与「N/M 已提交」进度条恒不渲染；时间线状态标签为空、操作人恒显示「系统」（operator 字段不存在，v-if 不成立）。",
+    "evidence": "前端 ArticleProgress.vue:16 task.task_number||task.id、34-57 行 task.decision/task.decided_at/task.decision_comment、74 行 v-if=\"task.total_reviewers\"、87 行 task.submitted_opinions、118-146 行 log.to_status/log.operator/log.remark；后端 apps/tasks/serializers.py:43-51 字段为 final_decision/decision_notes/assignments；StateLogSerializer 字段 to_state/operator_type/operator_name/trigger_reason。",
+    "file": "dev/frontend/src/views/tasks/ArticleProgress.vue",
+    "line": 34,
+    "severity": "一般",
+    "title": "作者稿件进度页读 task.decision/decided_at/decision_comment/total_reviewers/submitted_opinions，后端为 final_decision/decision_notes/assignments，终审结果与进度概览全部空白",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "formatDimensionScores 以 opinion.scores/opinion.comments 两个对象重建维度表格，修改建议区判断 opinion.suggestions。后端 ReviewOpinionSerializer 返回 dimension_scores（[{dimensionId,score,comment}] 数组）、dimension_scores_detail（含 dimensionName 的展开结构）与 revision_suggestions。触发条件：编辑部或作者打开审稿意见页查看任一已提交意见。后果：维度评分表恒为空数组（scores 为 undefined 直接 return []），审稿人各维度打分与评语完全不可见，意见页只剩综合评语文本；修改建议区永不显示。另外 :key=\"opinion.id\"（后端为 opinion_id）导致列表 key 重复 undefined。",
+    "evidence": "前端 OpinionView.vue:92-106 `if (!opinion.scores || !opinion.comments) return []`、60-63 行 opinion.suggestions、28 行 :key=\"opinion.id\"；后端 apps/forms/serializers.py:55-93 字段 dimension_scores/dimension_scores_detail/revision_suggestions/opinion_id。",
+    "file": "dev/frontend/src/views/review/OpinionView.vue",
+    "line": 93,
+    "severity": "一般",
+    "title": "审稿意见详情页按 opinion.scores/opinion.comments 对象解析维度评分、读 opinion.suggestions，后端返回 dimension_scores 数组/revision_suggestions，维度表格恒空、修改建议恒不显示",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "Profile.vue 编辑资料表单绑定 form.discipline（单选）与 form.tags（标签数组），保存时把整个 form PUT 到 /users/update_profile/。后端 UserSerializer 的字段是 user_id/name/email/roles/institution/research_areas/…，不存在 discipline 和 tags；DRF 对未知字段静默忽略。触发条件：审稿人在个人中心修改学科领域或增删专长标签后点击保存。后果：请求成功返回 200，页面弹出「保存成功」，但 research_areas 根本没有被提交，刷新后学科与专长全部丢失——用户被误导以为资料已更新，而编辑部分配审稿人时依赖的标签匹配（reviewers 接口按 research_areas 排序）永远拿不到审稿人维护的专长数据。展示侧 auth.user?.date_joined 也读不到（后端为 created_at）。",
+    "evidence": "前端 Profile.vue:74-79 form={name, institution, discipline, tags}、97-108 行 userApi.updateProfile(form)；后端 apps/users/serializers.py:9-13 fields=['user_id','name','email','roles','institution','research_areas','created_at','updated_at','password']；apps/users/views.py:89-104 reviewers 接口按 research_areas 做匹配排序。",
+    "file": "dev/frontend/src/views/Profile.vue",
+    "line": 102,
+    "severity": "一般",
+    "title": "个人中心保存的学科(discipline)/专长标签(tags)字段后端不存在（实际字段为 research_areas），提交被静默忽略，用户看到「保存成功」但数据全部丢失",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "上传成功后 uploadedFile.value 被赋为后端响应（含 file_id/original_name/file_path 等），checkAnonymization 第一行 `if (!uploadedFile.value?.id) return` 以不存在的 id 字段做守卫，而响应的主键字段是 file_id。触发条件：编辑上传 PDF 后点击「检查匿名化」。后果：函数直接 return，既不调用 check_metadata 接口也不给任何提示，按钮表现为无响应；PRD S-04 要求的「系统自动检查 PDF 元数据中的作者字段，如有值则警告编辑」（双盲匿名化检查）在 UI 上无法执行，双盲模式下的元数据泄露风险无法被编辑发现。",
+    "evidence": "前端 TaskCreate.vue:168-171 `if (!uploadedFile.value?.id) return; const res = await fileApi.checkMetadata(uploadedFile.value.id)`、159 行 `form.file_id = res.id || res.file_id`（说明作者知道响应里是 file_id）；后端 apps/files/serializers.py:28-35 FileUploadResponseSerializer 字段 file_id/original_name/…（无 id）；PRD 485 行双盲检查项含「系统自动检查PDF元数据中的作者字段」。",
+    "file": "dev/frontend/src/views/tasks/TaskCreate.vue",
+    "line": 169,
+    "severity": "一般",
+    "title": "「检查匿名化」按钮以 uploadedFile.value.id 做守卫，但上传响应主键是 file_id，按钮点击后静默无任何动作",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "响应拦截器对 401 一律按「登录已过期」处理（清 token、跳 /login），但登录接口在密码错误时同样返回 401 + {'error': '邮箱或密码错误'}。触发条件：用户在登录页输错密码。后果：用户看到的错误是「登录已过期，请重新登录」而非「邮箱或密码错误」，还伴随无意义的 localStorage 清理与向 /login 的重复跳转，错误反馈与真实原因完全不符。同时 400 分支只读 response.data.detail/response.data.error，而 DRF 校验错误返回的是 {字段名: [错误信息]} 字典，两个键都不存在，于是所有参数校验失败（本项目大量存在）一律显示笼统的「请求参数错误」，不暴露哪个字段不合法，加剧了前后端契约错位问题的排查难度。",
+    "evidence": "前端 api/index.js:29-35 case 401 统一提示「登录已过期」并清 storage 跳登录页、42-44 行 case 400 `response.data?.detail || response.data?.error || '请求参数错误'`；后端 apps/users/views.py:56-60 密码错误返回 401 {'error': '邮箱或密码错误'}；DRF raise_exception 校验失败返回字段键控 dict（如 {\"dimension_scores\": [\"该字段是必填项。\"]...}），无 detail/error 键。",
+    "file": "dev/frontend/src/api/index.js",
+    "line": 29,
+    "severity": "一般",
+    "title": "登录失败的 401 被拦截器统一当成「登录已过期」处理，用户输错密码看到错误提示；400 时只读 detail/error 键，DRF 字段级校验错误信息被吞掉",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "TaskDetail.vue 的操作按钮「分配审稿人」「强制汇总」「终审决策」只以 task.status（PENDING/SUBMITTED/SUMMARIZED）作为 v-if 条件，未判断当前用户角色；该路由本身也无 roles 限制（router/index.js:36-40 无 meta.roles）。触发条件：审稿人或作者通过 URL 直接访问 /tasks/:id（get_queryset 允许相关方查看任务详情）。后果：非编辑部用户看到编辑部专属操作按钮，点击后必然收到 403「没有权限执行此操作」；路由守卫只拦 meta.roles 声明的路由，任务详情页成为权限按钮的直接暴露点。",
+    "evidence": "前端 TaskDetail.vue:31-45 三个按钮仅 `v-if=\"task.status === 'PENDING'/'SUBMITTED'/'SUMMARIZED'\"` 无 auth.isEditor 判断；router/index.js:36-40 TaskDetail 路由无 roles meta；后端 apps/tasks/views.py:60-62/183-185/216-218 三个 action 均有 `if not request.user.is_editor: 403`。",
+    "file": "dev/frontend/src/views/tasks/TaskDetail.vue",
+    "line": 31,
+    "severity": "一般",
+    "title": "任务详情页的编辑部专属操作按钮（分配审稿人/强制汇总/终审决策）仅按任务状态显隐，未按用户角色控制，审稿人/作者点击必 403",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "ReviewForm.vue 底部「查看已有意见」按钮跳转 /opinions/:taskId，OpinionView 随即调 formApi.taskOpinions(taskId)。后端 task_opinions 的权限分支只有编辑（完整意见）与作者（匿名化意见），审稿人落入 else 返回 403「无权访问此接口」。触发条件：审稿人在审稿工作台点击「查看已有意见」。后果：审稿人收到 403 错误 toast「没有权限执行此操作」，意见列表为空——按钮把核心角色引向一个后端明确拒绝的页面。",
+    "evidence": "前端 ReviewForm.vue:139 `<el-button text @click=\"$router.push(`/opinions/${taskId}`)\">查看已有意见</el-button>`（该页面角色限定 REVIEWER）；后端 apps/forms/views.py:617-700 task_opinions：is_editor→完整、is_author→匿名化、`else: return Response({'error': '无权访问此接口'}, 403)`。",
+    "file": "dev/frontend/src/views/review/ReviewForm.vue",
+    "line": 139,
+    "severity": "一般",
+    "title": "审稿工作台向审稿人提供「查看已有意见」入口，但后端 task_opinions 明确禁止审稿人访问，点击必 403 死链",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   },
+   {
+    "description": "auth.login 把后端返回的 refresh 持久化到 localStorage，但 api/index.js 的请求拦截器只附 access token，响应拦截器对 401 的处理是直接清空两个 token 并跳登录页，没有任何用 refresh_token 换新 access 的逻辑（后端使用 rest_framework_simplejwt，具备 /api/token/refresh/ 能力，settings 配置 ACCESS 12h/REFRESH 7d）。触发条件：用户会话超过 12 小时（如隔天回到打开的页面）后任意一次 API 调用。后果：用户正在填写的表单/操作被 401 打断，被强制登出重新登录，refresh_token 形同虚设；审稿人长时间填写审稿意见（AI 生成 180s + 撰写）场景下丢失风险更高（虽有自动保存，但提交契约本身已损坏）。",
+    "evidence": "前端 stores/auth.js:32-34 存 refresh_token；api/index.js:11-20 请求拦截仅附 access、29-35 401 直接清 token 跳登录；后端 review_platform/settings.py:143-148 SIMPLE_JWT ACCESS_TOKEN_LIFETIME=12h/REFRESH_TOKEN_LIFETIME=7d，全前端 grep refresh 无任何刷新调用。",
+    "file": "dev/frontend/src/stores/auth.js",
+    "line": 33,
+    "severity": "建议",
+    "title": "refresh_token 登录时存入 localStorage 但全应用无任何刷新逻辑，access token 12 小时过期后用户被静默登出，长会话工作丢失",
+    "valid": null,
+    "verdict_reason": "核实员未返回结论",
+    "corrected_severity": null
+   }
+  ]
+ },
+ {
+  "dimension": "data-model",
+  "findings": [
+   {
+    "description": "apps/knowledge/services.py `_build_anonymized_dimensions`（L129-133）只剔除维度对象顶层的 ('reviewer_name','reviewer_email','reviewer_id') 三个 snake_case 键，而汇总报告写入 dimension_comparison 的身份信息是嵌在 scores 数组元素内的 camelCase 键（summaries/services.py L127-133 存入 reviewerId/reviewerName/opinionId），过滤条件永不命中，anonymized_dimensions 原样保留审稿人真实姓名与用户编号；template_info.dimensions（L89-92）直接复用同一份数据，anonymized_summary 的 `评分={[s for s in scores if s]}`（L173）更把含姓名的评分字典原样拼进可检索文本。触发条件：归档流程执行 auto_anonymize（PRD AC-K-01 要求决策后自动启动，该函数目前在 knowledge/views.py 仅导入未接线，一旦按 P0 设计接通即触发）。后果：任何审稿人检索/查看 APPROVED 条目（AC-K-11 允许）即泄露全体审稿人真实身份，直接违反 AC-K-02『自动移除审稿人姓名等结构化身份字段』；第二阶段审核只对 anonymized_summary 文本跑 4 类正则（_scan_segments），无法发现 JSON 内嵌姓名，审核通过也拦不住。",
+    "evidence": "knowledge/services.py L131: `if k not in ('reviewer_name', 'reviewer_email', 'reviewer_id'): cleaned[k] = v`；对照 summaries/services.py L127-133: `dim_data['scores'].append({'reviewerId': op.reviewer.user_id, 'reviewerName': op.reviewer.name, ...})`；L173: `parts.append(f'  {dim_name}: 评分={[s for s in scores if s]}, 均值={avg}')`；PRD §6.2.7 anonymizedDimensions 要求 scores(匿名)、AC-K-02 要求自动移除审稿人姓名。",
+    "file": "dev/backend/apps/knowledge/services.py",
+    "line": 131,
+    "severity": "致命",
+    "title": "知识库第一阶段匿名化是空操作：审稿人真实姓名与用户编号原样写入匿名化维度数据"
+   },
+   {
+    "description": "SummaryReport.dimension_comparison 是 PRD §6.2.6 DimensionComparison 的落库字段，PRD 要求每维度必含 averageScore（保留1位小数）、scoreRange、scoreDistribution（S-05 新增）、conflictLevel、comments；PRD §4.3.1 聚合输出也明确『每个维度的各审稿人评分、平均分、评分范围』。实现中 SummaryService.aggregate_opinions 生成的每个维度对象只有 {dimensionId, dimensionName, scores}。后果一：知识库评分区间检索 `anonymized_dimensions__contains=[{'avg': 4}]`（knowledge/services.py L443-446）查询的 'avg' 键在数据里根本不存在，high/mid_high 筛选永远返回空集，AC-K-06『按…评分…多维度组合筛选』失效；后果二：自动标签 `_generate_tags`（knowledge/services.py L267-276）用 dim.get('avg', 0) 恒取 0，所有归档条目被打上 low_score 错误标签，AC-K-04 评分区间标签错误；后果三：编辑汇总报告界面无平均分/范围/分布数据可展示。",
+    "evidence": "summaries/services.py L115-119: `dim_data = {'dimensionId': dim_id, 'dimensionName': dim_name, 'scores': []}`，无任何聚合字段；knowledge/services.py L444: `qs = qs.filter(anonymized_dimensions__contains=[{'avg': 4}])`；PRD §6.2.6 DimensionComparison 表（averageScore/scoreRange/scoreDistribution/conflictLevel 均为必填）、§4.3.1 聚合输出结构表。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 115,
+    "severity": "严重",
+    "title": "dimension_comparison 缺少 PRD 必填的 averageScore/scoreRange/scoreDistribution/conflictLevel/comments，知识库评分筛选与评分区间标签因此全部失效"
+   },
+   {
+    "description": "PRD §6.2.6 规定 DimensionComparison.scores 为 {reviewerId(匿名), score}、overall_comments 为 {reviewerId(匿名), comment}，明确要求匿名标识。SummaryService.aggregate_opinions 在 scores 中存入 op.reviewer.user_id（真实用户编号 U-YYYYMMDD-NNNN）和 op.reviewer.name（真实姓名），overall_comments 同样存 reviewerId+reviewerName。虽然汇总报告接口当前仅编辑部可读（summaries/views.py 各方法 403 拦截），但该 JSON 是知识库归档的直接数据源（knowledge/services.py `_build_anonymized_dimensions` 逐条复制 dimension_comparison），真实身份因此流入匿名化管道，与匿名化脱敏空操作问题联动形成泄露链；也使 PRD 定义的实体结构（匿名 reviewerId）从未在任何存储中成立。",
+    "evidence": "summaries/services.py L127-133: `'reviewerId': op.reviewer.user_id, 'reviewerName': op.reviewer.name, 'opinionId': op.opinion_id`；L176-186 overall_comments 同样含 reviewerId/reviewerName；PRD §6.2.6: scores 各审稿人评分 {reviewerId(匿名), score}、overall_comments {reviewerId(匿名), comment}。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 128,
+    "severity": "严重",
+    "title": "汇总报告 dimension_comparison.scores 与 overall_comments 存储真实审稿人身份，违反 PRD 匿名结构定义，且成为知识库泄露源"
+   },
+   {
+    "description": "PRD §3.3.1 模板配置规则明确『每个维度必须包含：维度名称、评价说明、评分指引』，预设四维模板表含逐档（5-1分）评分指引文本；§6.2.4/§6.2.8 Dimension 子结构为 {dimensionId, name, description, scoringGuide, order}。实现的 Template.dimensions 注释即为 `[{dimensionId, dimensionName, description, minWords}]`，全代码库（含 init_default_templates、seed_data、表单快照）无任何 scoringGuide/order 数据，改用了 PRD 未定义的 minWords。后果：审稿表单无法展示 PRD §3.3.2 要求的『评价说明和评分指引』引导，评分指引仅剩知识库冷启动指引一处静态文案。同时 TemplateSerializer 对 dimensions 零校验（不查 2-8 个维度、不查必填键），0/1/9 个维度或缺 dimensionId 的模板可正常创建，直到审稿人提交意见时才在 FormService.validate_opinion 报『维度数量不在2-8范围内』，任务此时已无法正常走完审稿流程。",
+    "evidence": "tasks/models.py L167: `dimensions = models.JSONField('维度配置', default=list)  # [{dimensionId, dimensionName, description, minWords}]`；tasks/views.py L369-372 预设模板无 scoringGuide；grep 全后端无 scoringGuide；forms/services.py L100-101: `if not (2 <= len(form_dimensions) <= 8): errors.append(...)`（提交时才校验）；PRD §3.3.1『每个维度必须包含：维度名称、评价说明、评分指引』。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 167,
+    "severity": "严重",
+    "title": "Template/ReviewForm 维度结构缺失 PRD 必填的 scoringGuide（评分指引）与 order，且模板创建对维度数量和结构完全无校验"
+   },
+   {
+    "description": "PRD §6.2.2 与技术方案 §3.1.2 均定义 templateId 为 NOT NULL FK→templates。实现是普通 CharField：ReviewTaskCreateSerializer（tasks/serializers.py L62-70）对 template_id 无存在性校验，编辑部可用不存在的模板编号创建任务（任务正常落库为 PENDING）；ReviewTaskSerializer.get_template_name 对 DoesNotExist 返回 None 容忍悬空引用。后果：FormService.create_form_for_task（forms/services.py L42）`Template.objects.get(template_id=task.template_id)` 抛 Template.DoesNotExist 未捕获，审稿人 get_form/提交意见接口 500，任务永久卡死在无法审稿状态。模板删除同样无从防护：ReviewForm.template 的 PROTECT 只保护已创建的表单，而表单是懒创建（forms/views.py L124-126 兜底才建）。",
+    "evidence": "tasks/models.py L31: `template_id = models.CharField('关联模板ID', max_length=64)`；tasks/serializers.py L66-70 CreateSerializer fields 含 template_id 但无 validate；forms/services.py L42: `template = Template.objects.get(template_id=task.template_id)`；技术方案 §3.1.2: `template_id | VARCHAR(64) | NOT NULL, FK→templates`。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 31,
+    "severity": "严重",
+    "title": "ReviewTask.template_id 是裸字符串而非外键，创建任务时不校验模板存在性，可产生引用不存在模板的僵尸任务并使审稿流程 500"
+   },
+   {
+    "description": "PRD §6.2.2 finalDecision 为枚举（ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT）。ReviewTask.final_decision 是无 choices 的 CharField；make_decision 端点（tasks/views.py L224-237）只校验非空与说明字数≥100，`task.final_decision = decision` 直接落库任意字符串（如 'accept'、'Reject!'）；KnowledgeItem.final_decision 同样无 choices。后果：DECIDED 为不可逆终态，拼写错误的决策值无法修正地存入任务，并被复制进知识库的 final_decision 字段、自动标签（knowledge/services.py L257-258）与按决策筛选条件（L434-435），前端决策展示与知识库决策口径筛选全部错乱；对比同文件 ReviewOpinion.recommendation 有完整 choices 且提交侧 ChoiceField 校验，终审决策这一最高级别字段反而零校验。",
+    "evidence": "tasks/models.py L39: `final_decision = models.CharField('终审决策', max_length=30, blank=True)`；tasks/views.py L224-235 无枚举校验；knowledge/models.py L28 同样无 choices；PRD §6.2.2: finalDecision 枚举值（ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT）。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 39,
+    "severity": "严重",
+    "title": "final_decision 全链路无枚举校验，任意字符串可写入终审决策并传播到知识库归档"
+   },
+   {
+    "description": "ReviewTask.author_user_id、ReviewAssignment.reviewer、ReviewOpinion.reviewer 三处用户外键均为 on_delete=CASCADE，加上 ReviewTask→ReviewAssignment/ReviewForm/ReviewOpinion/SummaryReport/StateLog 的级联，删除一个作者或审稿人用户会静默删除其全部任务、分配、审稿意见、汇总报告和状态日志（StateLog 也 CASCADE），违背 AC-T-04『所有状态变更可追溯』；已保留的 SummaryReport.opinion_ids 变成指向已删意见的悬空 ID 列表。触发条件现实存在：UserViewSet 是完整 ModelViewSet（users/urls.py 用 DefaultRouter 注册），DELETE /api/users/{id}/ 仅要求 IsAuthenticated、无角色检查；Django admin 也注册了 User（users/admin.py）。任何登录用户删除任意用户即可引发跨 6 张表的连锁清库，且无软删除机制兜底。",
+    "evidence": "tasks/models.py L32-33: `author_user_id = models.ForeignKey(User, on_delete=models.CASCADE, ...)`；L82-83 reviewer 同为 CASCADE；forms/models.py L41-44 task/form/assignment/reviewer 全 CASCADE；summaries/models.py L9 task CASCADE；users/urls.py: `router.register(r'users', UserViewSet, ...)` 且 views.py get_permissions 仅区分 login。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 33,
+    "severity": "严重",
+    "title": "用户外键全链路 on_delete=CASCADE：删除一个用户级联摧毁其全部审稿任务、意见、汇总报告与状态审计日志"
+   },
+   {
+    "description": "PRD §6.2.1 roles 为 Array<Enum>（REVIEWER/EDITOR/AUTHOR）。模型是 default=list 的 JSONField，UserCreateSerializer 仅 required 不校验枚举值，roles=['EDITER']（拼写错误）、[] 甚至非列表 JSON 都能入库。后果：is_editor/is_reviewer/is_author 三个属性全部为 False 时，ReviewTaskViewSet.get_queryset（tasks/views.py L19-31）的 if/elif 三分支都不命中，queryset 保持 ReviewTask.objects.all()——该用户以普通身份看到全部稿件（含双盲稿件标题摘要与全部审稿进度）；KnowledgeService.get_detail（knowledge/services.py L527-529）的『审稿人只能看 APPROVED』拦截同样依赖 is_reviewer，无角色用户可查看 PENDING_REVIEW/REJECTED 等未脱敏确认的条目。",
+    "evidence": "users/models.py L17: `roles = models.JSONField('角色列表', default=list)`；users/serializers.py L44-51 无 roles 值校验；tasks/views.py L23-30: `if user.is_editor: pass elif user.is_reviewer: ... elif user.is_author: ...`（无 else 收口）；knowledge/services.py L527: `if user.is_reviewer and not user.is_editor:`；PRD §6.2.1 roles 枚举值（REVIEWER/EDITOR/AUTHOR）。",
+    "file": "dev/backend/apps/users/models.py",
+    "line": 17,
+    "severity": "严重",
+    "title": "User.roles 为无枚举校验的裸 JSONField，非法角色值使权限分支全部落空，导致越权可见全部任务与未审核知识库条目"
+   },
+   {
+    "description": "PRD §6.2.5 Suggestion 子结构为 {suggestionId, type(枚举 CONTENT/METHOD/FORMAT/OTHER), content≤1000字符}，§3.3.3 规定『每条修改建议包含：建议类型（内容/方法/格式/其他）+ 建议内容文本』，§4.3.1 聚合输出要求『修改建议按类型（内容/方法/格式/其他）归类』。实现中模型字段为 `revision_suggestions = JSONField(default=list)`，提交序列化器是 ListField(child=CharField())——只收纯字符串列表，类型枚举从未被采集；汇总时按 dimensionId 分组（by_dimension），与 PRD 的按类型分组完全不同。后果：PRD 要求的类型化建议汇总在数据层无法实现（无数据可分组），作者侧『修改建议单独结构化展示、逐条对照修改』的呈现也失去结构支撑；数据一旦按字符串写入即不可再恢复类型信息。",
+    "evidence": "forms/models.py L48: `revision_suggestions = models.JSONField('修改建议', default=list, blank=True)`；forms/serializers.py L125-130: `revision_suggestions = serializers.ListField(child=serializers.CharField(), ...)`；summaries/services.py L148-173 按 dimensionId 而非 type 分组；PRD §4.3.1: 修改建议汇总『按类型（内容/方法/格式/其他）归类的所有修改建议列表』。",
+    "file": "dev/backend/apps/forms/models.py",
+    "line": 48,
+    "severity": "严重",
+    "title": "修改建议数据模型无类型结构（PRD Suggestion {suggestionId, type, content} 落空），按类型分组汇总从数据层即不可能"
+   },
+   {
+    "description": "PRD §6.2.3 assignmentStatus 枚举为（INVITED/ACCEPTED/REJECTED/INVITATION_EXPIRED/REVIEWING/SUBMITTED/OVERDUE），实现将其缩短为 'EXPIRED'。process_scheduled 命令置 EXPIRED（L76）、state_machine 注释与过滤（L128）、前端 status.js ASSIGNMENT_STATUS 均按 EXPIRED 对齐，代码内部自洽，但与 PRD 定义的枚举名直接冲突：以 PRD 为契约的对接方（或按 PRD 验收的测试）使用 INVITATION_EXPIRED 将匹配不到任何记录；且 EXPIRED 语义含糊（邀请过期），与未来可能的任务过期状态混淆。",
+    "evidence": "tasks/models.py L75: `EXPIRED = 'EXPIRED', '邀请过期'`；tasks/management/commands/process_scheduled.py L76: `assignment.assignment_status = 'EXPIRED'`；PRD §6.2.3: assignmentStatus 枚举值（…INVITATION_EXPIRED…）。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 75,
+    "severity": "一般",
+    "title": "分配状态枚举值 EXPIRED 与 PRD 定义的 INVITATION_EXPIRED 不一致"
+   },
+   {
+    "description": "PRD §6.2.2 将 subjectArea/manuscriptType 定义为枚举（经济学/计算机科学/生物学/…；研究论文/综述/案例研究/短文），技术方案 §3.1.2 标注『学科领域枚举』『稿件类型枚举』。实现中 ReviewTask.subject_area/manuscript_type 均为无 choices 的 CharField，ReviewTaskCreateSerializer 也无校验；KnowledgeItem.subject_area/manuscript_type/review_mode 同样裸存（review_mode 在 ReviewTask 有 choices，复制到 KnowledgeItem 时反而没有）。后果：编辑部分别录入『经济学』与『经济学 』『economics』即视为不同学科——编辑部看板按 subject 精确过滤（tasks/views.py L260-262）、知识库按 subject_area/manuscript_type 精确过滤（knowledge/services.py L426-431）与自动学科/类型标签（L249-254）全部按字面值匹配，口径稍不一致即漏筛，历史数据归档口径无法收敛。",
+    "evidence": "tasks/models.py L24-25: `subject_area = models.CharField('学科领域', max_length=50)` / `manuscript_type = models.CharField('稿件类型', max_length=50)`；knowledge/models.py L18-19,23 同样无 choices；PRD §6.2.2: subjectArea Enum、manuscriptType Enum（研究论文/综述/案例研究/短文）。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 24,
+    "severity": "一般",
+    "title": "subject_area/manuscript_type（及 KnowledgeItem.review_mode）无枚举约束，任意自由文本入库，破坏学科/类型筛选与标签口径"
+   },
+   {
+    "description": "技术方案 §3.2 明确列出 idx_tasks_status、idx_tasks_deadline、idx_tasks_status_deadline、idx_templates_status、idx_templates_subject。实现中 ReviewTask 的 Meta 无任何 indexes（author_user_id/created_by 仅靠 Django FK 自动索引），Template 的 Meta 同样为空。高频路径直接受影响：编辑部看板按 status 筛选与超时过滤（tasks/views.py L256-267，status 等值 + deadline__lt + status__in 组合）、任务列表按 -created_at 排序分页、模板列表默认 status='ACTIVE' 过滤（L335-337）均为全表扫描；migrations/0002_initial.py 仅给 ReviewAssignment 建了 3 个索引，技术方案承诺的 review_tasks/templates 侧索引一个都没有落地。",
+    "evidence": "tasks/models.py L36-49 ReviewTask 无 class Meta；L163-174 Template 无 Meta；tasks/migrations/0002_initial.py L58-66 仅 3 个 AddIndex 且全部在 review_assignments；技术方案 §3.2 索引表列出 idx_tasks_status/idx_tasks_deadline/idx_tasks_status_deadline/idx_templates_status/idx_templates_subject。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 36,
+    "severity": "一般",
+    "title": "ReviewTask 与 Template 缺少技术方案 §3.2 承诺的状态/截止日期索引，看板状态筛选与模板列表过滤全表扫描"
+   },
+   {
+    "description": "技术方案 §3.1.3/§3.4 按总监 N-02 裁决定义 attempt_count 语义：『同一任务中同一审稿人的分配次数，当同一审稿人被重新分配时该字段递增』，用于判断该审稿人是否值得再次分配。实现中 assign_reviewers 对已存在 (task, reviewer) 的分配直接 `continue` 跳过（tasks/views.py L89-90），全代码库除模型定义与序列化器只读字段外没有任何递增 attempt_count 的代码。字段值恒为默认 1，N-02 决策澄清的审稿人级分配历史追踪在数据上不存在，编辑部分配时无法据此避开反复拒邀的审稿人。",
+    "evidence": "tasks/models.py L93: `attempt_count = models.IntegerField('审稿人级分配次数', default=1)  # N-02澄清语义`；tasks/views.py L89-90: `if ReviewAssignment.objects.filter(task=task, reviewer=reviewer).exists(): continue`；grep 全后端无 attempt_count 递增；技术方案 §3.4: 『当同一审稿人被重新分配时，该字段递增』。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 93,
+    "severity": "一般",
+    "title": "attempt_count 永远停留在默认值 1，N-02 裁决的『同一审稿人重新分配时递增』语义无任何代码实现"
+   },
+   {
+    "description": "PRD §2.3.1 任务创建字段表（L138）与 §6.2.2 均要求 deadline ≥ 当前日期+7天，§2.3.4 异常处理表明确『截止日期早于当前日期+7天：1.表单校验拦截』。实现中 ReviewTask.deadline 是无 validator/CheckConstraint 的 DateField，ReviewTaskCreateSerializer 只有 validate_expected_reviewer_count 和 validate_keywords 两个校验器，deadline 传今天甚至过去日期都能创建成功。同理，技术方案 §3.1.2 承诺的 expected_reviewer_count CHECK(1-5) 与 §3.1.6 overall_comment CHECK(100-3000字) 在模型/数据库层均不存在（前者仅在创建序列化器、后者仅在 FormService 校验下限 100，无 3000 上限），Django admin、shell、数据修复脚本等旁路写入完全不受约束。",
+    "evidence": "tasks/models.py L29: `deadline = models.DateField('期望完成日期')` 无约束；tasks/serializers.py L62-80 仅有两个校验器；forms/services.py L163-167 只查 `len(overall_comment) < 100`；PRD L138: 『不得早于当前日期+7天』、L483: 『表单校验拦截』；技术方案 §3.1.2: `expected_reviewer_count | INTEGER | NOT NULL, CHECK(1-5)`、§3.1.6: `overall_comment | TEXT | NOT NULL, CHECK(100-3000字)`。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 29,
+    "severity": "一般",
+    "title": "deadline『≥当前日期+7天』约束在模型/序列化器/视图三层均未落地，任意过去日期可创建任务"
+   },
+   {
+    "description": "`_build_anonymized_summary` 渲染维度时读 `dim.get('dimension', dim.get('name', '未知维度'))` 与 `dim.get('avg', dim.get('average', 0))`，但 dimension_comparison 实际键是 dimensionName 且根本没有均值键；渲染分歧/一致点时读 cp.get('dimension')/cp.get('description')，实际键是 dimensionName/levelLabel/distributionText。触发条件：归档流程执行后，所有归档条目的 anonymized_summary 中每个维度显示为『未知维度: 评分=[…], 均值=0』、分歧点与一致点显示为空字符串。后果：AC-K-07『点击查看匿名化详情』展示的汇总文本对维度/分歧/一致三块核心信息全部无效，审稿人参考知识库时读到的是结构性废文本；且『评分=[…]』还把含审稿人姓名的字典拼进文本（与匿名化泄露问题同路径）。",
+    "evidence": "knowledge/services.py L170-173: `dim_name = dim.get('dimension', dim.get('name', '未知维度'))` / `avg = dim.get('avg', dim.get('average', 0))`；L179-180: `cp.get(\"dimension\", \"\")` / `cp.get(\"description\", \"\")`；对照 summaries/services.py L115-117 实际键 dimensionName、L250-261 分歧点键为 dimensionName/levelLabel/distributionText。",
+    "file": "dev/backend/apps/knowledge/services.py",
+    "line": 170,
+    "severity": "一般",
+    "title": "anonymized_summary 用与实际数据不符的键名渲染，归档文本全部退化为『未知维度/均值=0』、分歧一致点为空串"
+   },
+   {
+    "description": "PRD §6.2.6 定义 conflictLevel 枚举（SEVERE/OBVIOUS/CONSENSUS），ConflictPoint 必含 analysis（分歧核心分析，自动生成摘要）、ConsensusPoint 必含 consensusType 与 analysis。实现中 detect_conflicts 输出 'MODERATE'（PRD 枚举中不存在）且键名为 level 而非 conflictLevel，analyze_consensus 的键名为 type 而非 consensusType，两者均无 analysis 字段。后果：以 PRD 枚举为契约的消费方用 OBVIOUS 匹配不到任何分歧点；PRD §4.3.2 要求的『分歧核心分析』『分歧维度的文字意见并排对比』在存储结构中没有位置，分歧数据只有分差与分布、无分析文本；前端 status.js 中也没有任何 MODERATE/OBVIOUS 的映射定义，枚举值事实上处于无契约状态。",
+    "evidence": "summaries/services.py L233: `level = 'MODERATE'`，L250-260 conflict_points 无 analysis；L317-328 consensus_points 键为 type/typeLabel，无 analysis；PRD §6.2.6: conflictLevel 枚举值（SEVERE/OBVIOUS/CONSENSUS）、ConflictPoint/ConsensusPoint 子结构含 analysis（自动生成摘要）。",
+    "file": "dev/backend/apps/summaries/services.py",
+    "line": 233,
+    "severity": "一般",
+    "title": "分歧/一致点结构偏离 PRD：级别值用 MODERATE 而非 OBVIOUS、键名 level/type 不符、必填的自动分析 analysis 缺失"
+   },
+   {
+    "description": "PRD §6.3 定义 SummaryReport→KnowledgeItem 为 1:1（一份报告归档为一条知识条目），技术方案 §3.1.8 定义 source_report_id 为 NOT NULL FK→summary_reports。实现中 source_task_id 是裸 CharField，既无 unique 也非外键——同一任务可归档出多条 KnowledgeItem（auto_anonymize 的去重是先 filter 后 create 的检查-写入，无事务约束，存在竞态窗口，L76-78）；source_report 是 SET_NULL 的可空外键，任务删除级联删除报告后条目溯源链断裂，违背技术方案的 NOT NULL 定义。对比同模型内 anonymization_status 等字段的约束完整性，溯源关系是知识库『仅编辑部可见来源』权限设计（source_task_id 面向编辑部展示）的数据基础，约束缺失使重复归档与断链都无法在数据层发现。",
+    "evidence": "knowledge/models.py L16-17: `source_task_id = models.CharField('来源任务ID', max_length=64)` / `source_report = models.ForeignKey(SummaryReport, on_delete=models.SET_NULL, null=True, ...)`，无 UniqueConstraint；knowledge/services.py L76-78 check-then-create 去重；技术方案 §3.1.8: `source_report_id | VARCHAR(64) | NOT NULL, FK→summary_reports`；PRD §6.3: SummaryReport -> KnowledgeItem 1:1。",
+    "file": "dev/backend/apps/knowledge/models.py",
+    "line": 16,
+    "severity": "一般",
+    "title": "KnowledgeItem 溯源约束缺失：source_task_id 无唯一约束（PRD 定义 1:1 关系未强制），source_report 可空 SET_NULL 违背技术方案 NOT NULL"
+   },
+   {
+    "description": "PRD §3.3.1 模板配置规则（S-06 修改后仍保留）明确『模板一经使用（关联审稿任务）后不可修改，如需变更需创建新模板』。TemplateViewSet 是完整 ModelViewSet，update/partial_update 既不检查模板是否已被任务引用，也不像 create/toggle_status 那样校验 is_editor——任何登录用户（含审稿人、作者）都能 PUT/PATCH 修改任何模板的 dimensions。数据模型层面 ReviewTask.template_id 不是外键，导致『是否被使用』既无数据库约束也无现成关联可查。后果放大器：ReviewForm 是懒创建（get_form 兜底才调 create_form_for_task 冻结快照），任务创建后、审稿人首次打开表单前修改模板，快照冻结到的就是修改后的维度，违反 S-06 快照『确保已关联模板不受修改影响』的设计意图。",
+    "evidence": "tasks/views.py L327-356: TemplateViewSet 仅 create/toggle_status 校验 is_editor，update 无任何校验；forms/views.py L124-126: `except ReviewForm.DoesNotExist: form = FormService.create_form_for_task(task)`；PRD §3.3.1: 『模板一经使用（关联审稿任务）后不可修改，如需变更需创建新模板』（S-06 保留此约束）。",
+    "file": "dev/backend/apps/tasks/views.py",
+    "line": 327,
+    "severity": "一般",
+    "title": "『模板一经使用不可修改』的 PRD 保留约束未落地，且任何登录用户可修改任意模板，懒创建表单使快照冻结存在失效窗口"
+   },
+   {
+    "description": "PRD §6.2.3 与技术方案 §3.1.3 均定义 ReviewAssignment.reviewer_name 为 NOT NULL 冗余字段（从 User.name 冗余、仅编辑部可见）。实现中 ReviewAssignment 无该字段，序列化时通过 `serializers.CharField(source='reviewer.name')` 联表取值（tasks/serializers.py L17）。实体字段与 PRD/技术方案定义不一致：编辑部可见性由序列化层控制（当前序列化器对所有获取者统一输出 reviewer_name，可见性区分落在各视图的角色分支上），且依赖联表查询而非冗余存储，用户改名后历史分配记录的展示随联表实时变化，与 PRD『冗余』设计（记录分配时点姓名）的语义不同。",
+    "evidence": "tasks/models.py L77-102 ReviewAssignment 字段清单无 reviewer_name；tasks/serializers.py L17: `reviewer_name = serializers.CharField(source='reviewer.name', read_only=True)`；PRD §6.2.3: reviewerName 必填（仅编辑部可见，从User.name冗余）；技术方案 §3.1.3: reviewer_name VARCHAR(100) NOT NULL（冗余，仅编辑可见）。",
+    "file": "dev/backend/apps/tasks/models.py",
+    "line": 82,
+    "severity": "建议",
+    "title": "ReviewAssignment 缺少 PRD §6.2.3 / 技术方案 §3.1.3 定义的 reviewer_name 冗余字段"
+   }
+  ]
+ }
+]

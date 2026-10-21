@@ -1,0 +1,8 @@
+# 审稿协作平台 - Python 依赖（Python 3.14 / Django 5.2）
+Django>=5.2.4,<5.3
+djangorestframework>=3.16
+djangorestframework-simplejwt>=5.5
+django-cors-headers>=4.7
+psycopg[binary]>=3.2,<4
+PyMuPDF>=1.26
+PyPDF2==3.0.1

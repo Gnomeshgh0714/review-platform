@@ -1,0 +1,766 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>学术论文审稿协作平台 · 产品Demo</title>
+<style>
+:root {
+  --bg: #0a0e1a;
+  --surface: #111827;
+  --surface-2: #1a2332;
+  --border: #1e293b;
+  --ink: #e2e8f0;
+  --muted: #64748b;
+  --accent: #3b82f6;
+  --accent-2: #06b6d4;
+  --success: #10b981;
+  --warning: #f59e0b;
+  --danger: #ef4444;
+  --radius: 12px;
+  --mono: 'SF Mono', 'Fira Code', 'JetBrains Mono', monospace;
+  --sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--sans);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Nav */
+.nav {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 100;
+  background: rgba(10,14,26,0.85); backdrop-filter: blur(12px);
+  border-bottom: 1px solid var(--border);
+  padding: 12px 32px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.nav-brand { font-size: 15px; font-weight: 600; color: var(--accent); }
+.nav-links { display: flex; gap: 24px; }
+.nav-links a {
+  color: var(--muted); text-decoration: none; font-size: 13px;
+  transition: color 0.2s;
+}
+.nav-links a:hover { color: var(--ink); }
+.nav-links a.active { color: var(--accent); }
+
+/* Sections */
+section {
+  min-height: 100vh; padding: 100px 48px 60px;
+  display: flex; flex-direction: column; justify-content: center;
+  max-width: 1200px; margin: 0 auto;
+}
+.section-tag {
+  font-family: var(--mono); font-size: 12px; color: var(--accent-2);
+  text-transform: uppercase; letter-spacing: 2px; margin-bottom: 12px;
+}
+h1 { font-size: 48px; font-weight: 700; line-height: 1.2; margin-bottom: 16px; }
+h2 { font-size: 36px; font-weight: 700; margin-bottom: 16px; }
+h3 { font-size: 20px; font-weight: 600; margin-bottom: 8px; }
+p { color: var(--muted); font-size: 16px; max-width: 700px; }
+.subtitle { font-size: 18px; color: var(--muted); margin-bottom: 40px; max-width: 700px; }
+
+/* Hero */
+.hero { text-align: left; }
+.hero h1 { font-size: 56px; max-width: 900px; }
+.hero h1 span { color: var(--accent); }
+.hero-meta {
+  display: flex; gap: 32px; margin-top: 32px;
+  font-size: 13px; color: var(--muted); font-family: var(--mono);
+}
+.hero-meta div { display: flex; align-items: center; gap: 8px; }
+.hero-meta .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--success); }
+
+/* Pain Points */
+.pain-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 16px; margin-top: 32px;
+}
+.pain-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px;
+  position: relative; overflow: hidden;
+}
+.pain-card::before {
+  content: ''; position: absolute; top: 0; left: 0; right: 0; height: 3px;
+  background: var(--danger);
+}
+.pain-card .pain-id { font-family: var(--mono); font-size: 12px; color: var(--danger); margin-bottom: 8px; }
+.pain-card h3 { color: var(--ink); }
+.pain-card .severity {
+  display: inline-block; padding: 2px 8px; border-radius: 4px;
+  font-size: 11px; font-weight: 600; margin-bottom: 12px;
+}
+.sev-high { background: rgba(239,68,68,0.15); color: var(--danger); }
+.sev-mid { background: rgba(245,158,11,0.15); color: var(--warning); }
+.pain-card p { font-size: 14px; line-height: 1.5; }
+
+/* Solution Architecture */
+.arch-flow {
+  display: flex; flex-direction: column; gap: 2px; margin-top: 32px;
+}
+.arch-layer {
+  display: flex; align-items: center; gap: 16px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px 24px;
+  position: relative;
+}
+.arch-layer:hover { border-color: var(--accent); }
+.arch-layer .layer-icon {
+  width: 40px; height: 40px; border-radius: 8px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 14px; font-weight: 700;
+  flex-shrink: 0;
+}
+.arch-layer .layer-info { flex: 1; }
+.arch-layer .layer-info h3 { margin-bottom: 4px; }
+.arch-layer .layer-info p { font-size: 14px; }
+.arch-layer .layer-tag {
+  font-family: var(--mono); font-size: 11px; color: var(--muted);
+  padding: 4px 8px; background: var(--surface-2); border-radius: 4px;
+}
+.arch-arrow {
+  text-align: center; color: var(--muted); font-size: 20px; padding: 4px 0;
+}
+
+/* State Machine */
+.state-flow {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px;
+  margin-top: 32px;
+}
+.state-node {
+  padding: 12px 20px; border-radius: 8px;
+  font-size: 14px; font-weight: 600;
+  border: 2px solid; transition: all 0.3s;
+  cursor: pointer; position: relative;
+}
+.state-node:hover { transform: translateY(-2px); }
+.state-pending { border-color: var(--muted); color: var(--muted); background: var(--surface); }
+.state-assigned { border-color: var(--warning); color: var(--warning); background: rgba(245,158,11,0.08); }
+.state-reviewing { border-color: var(--accent); color: var(--accent); background: rgba(59,130,246,0.08); }
+.state-submitted { border-color: var(--accent-2); color: var(--accent-2); background: rgba(6,182,212,0.08); }
+.state-summarized { border-color: #8b5cf6; color: #8b5cf6; background: rgba(139,92,246,0.08); }
+.state-decided { border-color: var(--success); color: var(--success); background: rgba(16,185,129,0.08); }
+.state-arrow { color: var(--muted); font-size: 18px; }
+
+.state-detail {
+  margin-top: 24px; padding: 20px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); font-size: 14px;
+  min-height: 80px;
+}
+.state-detail .detail-label {
+  font-family: var(--mono); font-size: 11px; color: var(--accent-2);
+  text-transform: uppercase; margin-bottom: 8px;
+}
+
+/* Rule Engine */
+.rule-list { margin-top: 24px; }
+.rule-item {
+  display: flex; align-items: center; gap: 16px;
+  padding: 14px 20px; background: var(--surface);
+  border: 1px solid var(--border); border-radius: 8px;
+  margin-bottom: 8px; transition: border-color 0.2s;
+}
+.rule-item:hover { border-color: var(--accent); }
+.rule-priority {
+  width: 32px; height: 32px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-family: var(--mono); font-size: 13px; font-weight: 700;
+  flex-shrink: 0;
+}
+.rule-content { flex: 1; }
+.rule-content .rule-name { font-size: 14px; font-weight: 600; }
+.rule-content .rule-desc { font-size: 13px; color: var(--muted); }
+.rule-conclusion {
+  font-family: var(--mono); font-size: 12px;
+  padding: 4px 10px; border-radius: 4px;
+  background: var(--surface-2);
+}
+
+/* Tech Stack */
+.tech-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+  gap: 16px; margin-top: 32px;
+}
+.tech-card {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 20px;
+}
+.tech-card .tech-label {
+  font-family: var(--mono); font-size: 11px; color: var(--accent-2);
+  text-transform: uppercase; margin-bottom: 8px;
+}
+.tech-card h3 { font-size: 18px; margin-bottom: 4px; }
+.tech-card p { font-size: 13px; }
+.tech-card .tech-items {
+  display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px;
+}
+.tech-tag {
+  font-family: var(--mono); font-size: 11px;
+  padding: 3px 8px; background: var(--surface-2); border-radius: 4px;
+  color: var(--ink);
+}
+
+/* Workflow Demo */
+.workflow-demo {
+  margin-top: 32px;
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); overflow: hidden;
+}
+.workflow-tabs {
+  display: flex; border-bottom: 1px solid var(--border);
+}
+.workflow-tab {
+  padding: 14px 24px; font-size: 14px; font-weight: 500;
+  color: var(--muted); cursor: pointer; transition: all 0.2s;
+  border-bottom: 2px solid transparent;
+}
+.workflow-tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.workflow-tab:hover { color: var(--ink); }
+.workflow-content { padding: 28px; min-height: 320px; }
+
+.role-panel { display: none; }
+.role-panel.active { display: block; }
+
+.action-list { display: flex; flex-direction: column; gap: 12px; }
+.action-item {
+  display: flex; align-items: flex-start; gap: 12px;
+  padding: 14px; background: var(--surface-2); border-radius: 8px;
+}
+.action-num {
+  width: 24px; height: 24px; border-radius: 50%;
+  background: var(--accent); color: white;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 12px; font-weight: 700; flex-shrink: 0;
+}
+.action-item .action-text { flex: 1; }
+.action-item .action-text strong { font-size: 14px; }
+.action-item .action-text span { font-size: 13px; color: var(--muted); display: block; margin-top: 2px; }
+.action-api {
+  font-family: var(--mono); font-size: 11px; color: var(--accent-2);
+  padding: 2px 6px; background: rgba(6,182,212,0.1); border-radius: 3px;
+  margin-top: 4px; display: inline-block;
+}
+
+/* Stats */
+.stats-row {
+  display: grid; grid-template-columns: repeat(4, 1fr);
+  gap: 16px; margin-top: 32px;
+}
+.stat-box {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: 24px; text-align: center;
+}
+.stat-num { font-size: 36px; font-weight: 700; color: var(--accent); }
+.stat-label { font-size: 13px; color: var(--muted); margin-top: 4px; }
+
+/* Footer */
+.footer {
+  padding: 40px 48px; text-align: center;
+  border-top: 1px solid var(--border);
+  color: var(--muted); font-size: 13px;
+}
+
+/* Animate */
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(20px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+.fade-in { animation: fadeUp 0.6s ease-out; }
+
+/* Responsive */
+@media (max-width: 768px) {
+  section { padding: 80px 20px 40px; }
+  h1 { font-size: 32px; }
+  h2 { font-size: 26px; }
+  .stats-row { grid-template-columns: repeat(2, 1fr); }
+  .nav-links { display: none; }
+}
+</style>
+</head>
+<body>
+
+<nav class="nav">
+  <div class="nav-brand">审稿协作平台 · Demo</div>
+  <div class="nav-links">
+    <a href="#vision" class="active">设计思路</a>
+    <a href="#pain">痛点分析</a>
+    <a href="#architecture">架构设计</a>
+    <a href="#workflow">协作流程</a>
+    <a href="#rules">规则引擎</a>
+    <a href="#tech">技术栈</a>
+  </div>
+</nav>
+
+<!-- 1. 产品愿景 -->
+<section id="vision" class="hero">
+  <div class="section-tag">PRODUCT VISION</div>
+  <h1>让学术审稿从<span>「黑箱等待」</span><br>变为<span>「透明协作」</span></h1>
+  <p class="subtitle">
+    面向学术期刊编辑部、审稿人、作者三类角色的审稿协作平台。
+    解决任务分配低效、意见格式混乱、汇总对比困难、经验无法复用四大痛点。
+  </p>
+  <div class="hero-meta">
+    <div><span class="dot"></span> P0 四项核心功能</div>
+    <div><span class="dot"></span> 8个后端模块 · 21张数据表</div>
+    <div><span class="dot"></span> Django + PostgreSQL 15</div>
+  </div>
+</section>
+
+<!-- 2. 痛点分析 -->
+<section id="pain">
+  <div class="section-tag">PAIN POINTS</div>
+  <h2>5个核心痛点，4个高严重度</h2>
+  <p>基于用研报告，梳理出现有审稿流程中的5个核心痛点，每个痛点均有具体场景支撑。</p>
+  <div class="pain-grid">
+    <div class="pain-card">
+      <div class="pain-id">P1</div>
+      <span class="severity sev-high">严重 · 高</span>
+      <h3>任务分配效率低</h3>
+      <p>编辑依赖个人经验和人脉分配审稿人，信息散落各处，平均耗时3-7天。影响全部三类角色。</p>
+    </div>
+    <div class="pain-card">
+      <div class="pain-id">P2</div>
+      <span class="severity sev-high">严重 · 高</span>
+      <h3>审稿意见格式不统一</h3>
+      <p>审稿人自由文本提交，格式各异。编辑需1-2小时手动整理，新手审稿人尤其困扰。</p>
+    </div>
+    <div class="pain-card">
+      <div class="pain-id">P3</div>
+      <span class="severity sev-high">严重 · 高</span>
+      <h3>多审稿人意见难汇总</h3>
+      <p>2-4位审稿人意见全靠手动阅读对比，耗时2-3小时，三大竞品均无自动汇总功能。</p>
+    </div>
+    <div class="pain-card">
+      <div class="pain-id">P4</div>
+      <span class="severity sev-mid">严重 · 中</span>
+      <h3>审稿经验难复用</h3>
+      <p>审稿意见随稿件归档，思考框架和评价标准无法独立沉淀。新手审稿耗时6小时+。</p>
+    </div>
+    <div class="pain-card">
+      <div class="pain-id">P5</div>
+      <span class="severity sev-high">严重 · 高</span>
+      <h3>审稿进度不透明</h3>
+      <p>作者只能看到"Under Review"笼统状态。编辑需逐一邮件催问，沟通成本极高。</p>
+    </div>
+  </div>
+</section>
+
+<!-- 3. 架构设计 -->
+<section id="architecture">
+  <div class="section-tag">ARCHITECTURE</div>
+  <h2>四层架构，自底向上</h2>
+  <p>P0四项功能构成自底向上的数据流依赖链，每层为上层提供数据输入。</p>
+  <div class="arch-flow">
+    <div class="arch-layer">
+      <div class="layer-icon" style="background:rgba(100,116,139,0.15);color:var(--muted);">L1</div>
+      <div class="layer-info">
+        <h3>审稿任务管理 <span class="layer-tag">基础层 · 优先级1</span></h3>
+        <p>任务创建/分配/追踪，状态机11条转换路径，事务+行锁并发控制</p>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ 产生任务数据</div>
+    <div class="arch-layer">
+      <div class="layer-icon" style="background:rgba(245,158,11,0.15);color:var(--warning);">L2</div>
+      <div class="layer-info">
+        <h3>结构化审稿表单 <span class="layer-tag">采集层 · 优先级2</span></h3>
+        <p>预设四维模板（研究意义/创新性/方法/写作），评分1-5分+文字说明，草稿自动保存</p>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ 产生结构化审稿意见</div>
+    <div class="arch-layer">
+      <div class="layer-icon" style="background:rgba(59,130,246,0.15);color:var(--accent);">L3</div>
+      <div class="layer-info">
+        <h3>审稿意见汇总 <span class="layer-tag">分析层 · 优先级3 · 核心差异化</span></h3>
+        <p>按维度自动对齐，分歧标注（≥3分严重/2分明显/≤1一致），7条规则链式匹配终审建议</p>
+      </div>
+    </div>
+    <div class="arch-arrow">↓ 产生汇总数据和决策记录</div>
+    <div class="arch-layer">
+      <div class="layer-icon" style="background:rgba(139,92,246,0.15);color:#8b5cf6;">L4</div>
+      <div class="layer-info">
+        <h3>审稿知识库 <span class="layer-tag">沉淀层 · 优先级4 · 长期壁垒</span></h3>
+        <p>两阶段匿名化归档（自动+人工审核），多条件检索，冷启动种子数据+模板指引降级</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 4. 状态机 -->
+<section id="state-machine">
+  <div class="section-tag">STATE MACHINE</div>
+  <h2>任务状态机：6状态，11条转换路径</h2>
+  <p>覆盖正常路径和异常路径，无死锁、无不可达状态。点击查看各状态详情。</p>
+  <div class="state-flow">
+    <div class="state-node state-pending" onclick="showState('pending')">待分配 PENDING</div>
+    <span class="state-arrow">→</span>
+    <div class="state-node state-assigned" onclick="showState('assigned')">已分配 ASSIGNED</div>
+    <span class="state-arrow">→</span>
+    <div class="state-node state-reviewing" onclick="showState('reviewing')">审稿中 REVIEWING</div>
+    <span class="state-arrow">→</span>
+    <div class="state-node state-submitted" onclick="showState('submitted')">已提交 SUBMITTED</div>
+    <span class="state-arrow">→</span>
+    <div class="state-node state-summarized" onclick="showState('summarized')">已汇总 SUMMARIZED</div>
+    <span class="state-arrow">→</span>
+    <div class="state-node state-decided" onclick="showState('decided')">已决策 DECIDED</div>
+  </div>
+  <div class="state-detail" id="stateDetail">
+    <div class="detail-label">点击上方状态查看详情</div>
+  </div>
+</section>
+
+<!-- 5. 协作流程 Demo -->
+<section id="workflow">
+  <div class="section-tag">WORKFLOW</div>
+  <h2>三类角色，一个闭环</h2>
+  <p>编辑部创建任务 → 审稿人审稿 → 系统汇总 → 编辑部决策 → 知识库归档。点击切换角色视角。</p>
+  <div class="workflow-demo">
+    <div class="workflow-tabs">
+      <div class="workflow-tab active" onclick="switchRole('editor')">编辑部</div>
+      <div class="workflow-tab" onclick="switchRole('reviewer')">审稿人</div>
+      <div class="workflow-tab" onclick="switchRole('author')">作者</div>
+    </div>
+    <div class="workflow-content">
+      <div class="role-panel active" id="panel-editor">
+        <div class="action-list">
+          <div class="action-item">
+            <div class="action-num">1</div>
+            <div class="action-text">
+              <strong>创建审稿任务</strong>
+              <span>填写稿件信息、上传PDF、关联模板、设置审稿模式和截止日期</span>
+              <div class="action-api">POST /api/tasks/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">2</div>
+            <div class="action-text">
+              <strong>分配审稿人</strong>
+              <span>按标签匹配排序搜索审稿人，批量分配，自动发送邀请通知</span>
+              <div class="action-api">POST /api/tasks/{id}/assign_reviewers/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">3</div>
+            <div class="action-text">
+              <strong>查看编辑部看板</strong>
+              <span>按状态/学科/截止日期筛选，超时高亮，统计概览</span>
+              <div class="action-api">GET /api/tasks/dashboard/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">4</div>
+            <div class="action-text">
+              <strong>触发汇总报告</strong>
+              <span>全部审稿人提交后，一键生成汇总报告（含分歧标注+规则匹配建议）</span>
+              <div class="action-api">POST /api/summaries/generate/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">5</div>
+            <div class="action-text">
+              <strong>录入终审决策</strong>
+              <span>参考系统建议，录入决策结果（≥100字说明），通知作者</span>
+              <div class="action-api">POST /api/tasks/{id}/make_decision/</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="role-panel" id="panel-reviewer">
+        <div class="action-list">
+          <div class="action-item">
+            <div class="action-num">1</div>
+            <div class="action-text">
+              <strong>接收审稿邀请</strong>
+              <span>站内通知+邮件提醒，一键接受或拒绝（拒绝需填写理由）</span>
+              <div class="action-api">POST /api/tasks/{id}/accept_invitation/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">2</div>
+            <div class="action-text">
+              <strong>查看任务列表</strong>
+              <span>按截止日期排序，倒计时提醒，优先级高亮</span>
+              <div class="action-api">GET /api/tasks/my_tasks/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">3</div>
+            <div class="action-text">
+              <strong>填写审稿表单</strong>
+              <span>按四维模板（研究意义/创新性/方法/写作）评分1-5分+文字说明，草稿60秒自动保存</span>
+              <div class="action-api">POST /api/opinions/save_draft/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">4</div>
+            <div class="action-text">
+              <strong>参考知识库</strong>
+              <span>检索历史审稿案例和模板，降低审稿认知负担（冷启动期展示评分指引）</span>
+              <div class="action-api">GET /api/knowledge/search/?keyword=xxx</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">5</div>
+            <div class="action-text">
+              <strong>提交审稿意见</strong>
+              <span>校验全部维度评分+字数，提交后触发状态机检查是否全部完成</span>
+              <div class="action-api">POST /api/opinions/submit/</div>
+            </div>
+          </div>
+        </div>
+      </div>
+      <div class="role-panel" id="panel-author">
+        <div class="action-list">
+          <div class="action-item">
+            <div class="action-num">1</div>
+            <div class="action-text">
+              <strong>查看稿件进度</strong>
+              <span>细粒度状态追踪：待分配→已分配→审稿中→已提交→已汇总→已决策</span>
+              <div class="action-api">GET /api/tasks/my_articles/</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">2</div>
+            <div class="action-text">
+              <strong>接收审稿决策通知</strong>
+              <span>终审决策完成后，站内通知推送结果</span>
+              <div class="action-api">通知类型: DECIDE</div>
+            </div>
+          </div>
+          <div class="action-item">
+            <div class="action-num">3</div>
+            <div class="action-text">
+              <strong>查看审稿意见</strong>
+              <span>双盲保护下查看匿名化意见，按维度结构化展示，标注分歧点和一致点</span>
+              <div class="action-api">GET /api/opinions/task_opinions/?task_id=xxx</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 6. 规则引擎 -->
+<section id="rules">
+  <div class="section-tag">RULE ENGINE</div>
+  <h2>终审建议规则引擎</h2>
+  <p>7条规则按优先级链式匹配，高优先级先匹配。覆盖全票/多数/分散/对立全部场景。</p>
+  <div class="rule-list">
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(239,68,68,0.15);color:var(--danger);">7</div>
+      <div class="rule-content">
+        <div class="rule-name">接收与拒稿并存</div>
+        <div class="rule-desc">审稿意见中出现 ACCEPT + REJECT 直接对立</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--danger);">严重分歧需讨论</div>
+    </div>
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(245,158,11,0.15);color:var(--warning);">4</div>
+      <div class="rule-content">
+        <div class="rule-name">三选分散（无接收 or 无拒稿）</div>
+        <div class="rule-desc">A: 小修+大修+拒稿分散无接收 / B: 接收+小修+大修分散无拒稿</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--warning);">分歧需讨论</div>
+    </div>
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(239,68,68,0.1);color:var(--danger);">6</div>
+      <div class="rule-content">
+        <div class="rule-name">多数拒稿（≥半数）</div>
+        <div class="rule-desc">推荐REJECT的审稿人数量 ≥ ceil(总数/2)</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--danger);">建议拒稿</div>
+    </div>
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(245,158,11,0.1);color:var(--warning);">5</div>
+      <div class="rule-content">
+        <div class="rule-name">多数大修</div>
+        <div class="rule-desc">推荐MAJOR_REVISION的审稿人占多数</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--warning);">建议大修</div>
+    </div>
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(59,130,246,0.1);color:var(--accent);">3</div>
+      <div class="rule-content">
+        <div class="rule-name">多数认可但有异议</div>
+        <div class="rule-desc">多数接收/小修，但存在大修或拒稿</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--accent);">倾向接收但需讨论</div>
+    </div>
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(16,185,129,0.1);color:var(--success);">2</div>
+      <div class="rule-content">
+        <div class="rule-name">多数接收/小修（≥半数）</div>
+        <div class="rule-desc">无拒稿，多数推荐ACCEPT或MINOR_REVISION</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--success);">倾向接收</div>
+    </div>
+    <div class="rule-item">
+      <div class="rule-priority" style="background:rgba(16,185,129,0.15);color:var(--success);">1</div>
+      <div class="rule-content">
+        <div class="rule-name">全票接收</div>
+        <div class="rule-desc">全部审稿人推荐ACCEPT</div>
+      </div>
+      <div class="rule-conclusion" style="color:var(--success);">建议接收</div>
+    </div>
+  </div>
+</section>
+
+<!-- 7. 技术栈 -->
+<section id="tech">
+  <div class="section-tag">TECH STACK</div>
+  <h2>技术选型</h2>
+  <p>基于PRD需求和技术实施方案，选择成熟、可维护、适合P0快速验证的技术栈。</p>
+  <div class="tech-grid">
+    <div class="tech-card">
+      <div class="tech-label">FRONTEND</div>
+      <h3>Vue 3 + Element Plus</h3>
+      <p>动态表单渲染、数据表格、流程图展示</p>
+      <div class="tech-items">
+        <span class="tech-tag">Vue 3</span>
+        <span class="tech-tag">Element Plus</span>
+        <span class="tech-tag">Pinia</span>
+        <span class="tech-tag">ECharts</span>
+      </div>
+    </div>
+    <div class="tech-card">
+      <div class="tech-label">BACKEND</div>
+      <h3>Django 5 + DRF</h3>
+      <p>事务+行锁并发控制、状态机、规则引擎</p>
+      <div class="tech-items">
+        <span class="tech-tag">Django 5.2</span>
+        <span class="tech-tag">DRF 3.17</span>
+        <span class="tech-tag">SimpleJWT</span>
+        <span class="tech-tag">Celery</span>
+      </div>
+    </div>
+    <div class="tech-card">
+      <div class="tech-label">DATABASE</div>
+      <h3>PostgreSQL 15</h3>
+      <p>JSONB存储结构化数据、GIN索引支持数组查询</p>
+      <div class="tech-items">
+        <span class="tech-tag">PG 15.18</span>
+        <span class="tech-tag">21 tables</span>
+        <span class="tech-tag">JSONB</span>
+        <span class="tech-tag">GIN Index</span>
+      </div>
+    </div>
+    <div class="tech-card">
+      <div class="tech-label">INFRA</div>
+      <h3>本地开发环境</h3>
+      <p>P0阶段本地部署，后续可迁移云服务</p>
+      <div class="tech-items">
+        <span class="tech-tag">Redis (Celery)</span>
+        <span class="tech-tag">uv venv</span>
+        <span class="tech-tag">Local FS</span>
+      </div>
+    </div>
+  </div>
+  <div class="stats-row">
+    <div class="stat-box">
+      <div class="stat-num">8</div>
+      <div class="stat-label">后端模块</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-num">21</div>
+      <div class="stat-label">数据库表</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-num">11</div>
+      <div class="stat-label">状态转换路径</div>
+    </div>
+    <div class="stat-box">
+      <div class="stat-num">7</div>
+      <div class="stat-label">规则引擎规则</div>
+    </div>
+  </div>
+</section>
+
+<div class="footer">
+  学术论文审稿协作平台 · 多Agent产品经理团队项目 · 2026-07-17
+</div>
+
+<script>
+// State machine details
+const stateDetails = {
+  pending: {
+    label: 'PENDING · 待分配',
+    desc: '任务已创建，等待编辑部分配审稿人。编辑可搜索审稿人（标签匹配排序），批量分配。',
+    transitions: '→ ASSIGNED（分配审稿人，至少1位邀请发出后触发）'
+  },
+  assigned: {
+    label: 'ASSIGNED · 已分配',
+    desc: '已向审稿人发送邀请，等待接受/拒绝。邀请有效期3天。',
+    transitions: '→ REVIEWING（首位审稿人接受）\n→ PENDING（全部拒绝，retry_count+1，>3次通知主编）'
+  },
+  reviewing: {
+    label: 'REVIEWING · 审稿中',
+    desc: '审稿人正在审稿。草稿60秒自动保存，提交时校验全部维度。',
+    transitions: '→ SUBMITTED（全部提交 / 编辑强制汇总）\n→ PENDING（全部超时，编辑选择回退）\n→ SUBMITTED（部分超时，编辑选择强制汇总）'
+  },
+  submitted: {
+    label: 'SUBMITTED · 已提交',
+    desc: '全部审稿人已提交意见（或编辑强制汇总）。等待编辑部触发汇总报告生成。',
+    transitions: '→ SUMMARIZED（编辑触发汇总，规则引擎自动匹配终审建议）'
+  },
+  summarized: {
+    label: 'SUMMARIZED · 已汇总',
+    desc: '汇总报告已生成，含维度对比表、分歧标注、一致点分析、规则匹配建议。等待编辑录入决策。',
+    transitions: '→ DECIDED（编辑录入终审决策，≥100字说明）'
+  },
+  decided: {
+    label: 'DECIDED · 已决策',
+    desc: '终审决策已录入，通知作者。任务进入终态（P0不支持退稿重审，P1预留round字段）。',
+    transitions: 'P0终态 · 触发知识库自动归档（两阶段匿名化）'
+  }
+};
+
+function showState(key) {
+  const detail = stateDetails[key];
+  const el = document.getElementById('stateDetail');
+  el.innerHTML = `
+    <div class="detail-label">${detail.label}</div>
+    <p style="color:var(--ink);margin-bottom:8px;">${detail.desc}</p>
+    <p style="font-family:var(--mono);font-size:13px;color:var(--accent-2);white-space:pre-line;">${detail.transitions}</p>
+  `;
+}
+
+// Role switch
+function switchRole(role) {
+  document.querySelectorAll('.workflow-tab').forEach((t, i) => {
+    t.classList.toggle('active', i === ['editor','reviewer','author'].indexOf(role));
+  });
+  document.querySelectorAll('.role-panel').forEach(p => p.classList.remove('active'));
+  document.getElementById(`panel-${role}`).classList.add('active');
+}
+
+// Nav active state on scroll
+const sections = document.querySelectorAll('section');
+const navLinks = document.querySelectorAll('.nav-links a');
+window.addEventListener('scroll', () => {
+  let current = '';
+  sections.forEach(s => {
+    if (window.scrollY >= s.offsetTop - 100) current = s.id;
+  });
+  navLinks.forEach(a => {
+    a.classList.toggle('active', a.getAttribute('href') === '#' + current);
+  });
+});
+
+// Smooth scroll
+navLinks.forEach(a => {
+  a.addEventListener('click', e => {
+    e.preventDefault();
+    const target = document.querySelector(a.getAttribute('href'));
+    if (target) target.scrollIntoView({ behavior: 'smooth' });
+  });
+});
+</script>
+</body>
+</html>

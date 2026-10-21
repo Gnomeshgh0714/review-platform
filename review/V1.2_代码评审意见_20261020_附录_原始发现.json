@@ -1,0 +1,754 @@
+[
+  {
+    "dimension": "p0-security",
+    "findings": [
+      {
+        "evidence": "ai_review.py L93-99: `if not os.path.isabs(file_path): file_path = os.path.join(settings.MEDIA_ROOT, file_path)` 之后直接 `fitz.open(file_path)`——绝对路径原样打开。而 ReviewTaskSerializer 的 read_only_fields（tasks/serializers.py L51-52）不含 manuscript_file/publish_opinions_to_author，ReviewTaskViewSet 未覆写 partial_update（轮1#15，决策#012 未纳入修复范围），被分配审稿人可 PATCH /api/tasks/{id}/ {\"manuscript_file\":\"/任意路径\"}（queryset 允许其访问被分配任务），再 POST /api/forms/ai_review/（views.py L173-186 仅校验存在分配记录且状态 ACCEPTED/REVIEWING）或 validate_references（ref_validation.py L434 同样调用 extract_pdf_text）。",
+        "impact": "被分配审稿人（或作者对自己的任务）可将任务稿件路径指向服务器上任意文件：fitz 可解析的任意 PDF（包括其他作者未发表的稿件全文）被提取文本后经 LLM 汇总在 AI 审稿响应中回流给攻击者，实现跨稿件机密性破坏与任意服务端文件内容读取（依赖 REVIEWER_LLM_API_KEY 已配置；未配置时仍构成任意文件存在性/可解析性探测 oracle，extract 发生在 call_llm 之前）。依赖轮1#15未修复，但该 isabs 分支把「改字段」升级为「读文件」原语。",
+        "location": "dev/backend/apps/forms/ai_review.py:94-99（配合 dev/backend/apps/forms/views.py:173-186、dev/backend/apps/tasks/serializers.py:51-52）",
+        "severity": "致命",
+        "title": "ai_review/validate_references 的 extract_pdf_text 对绝对路径直接打开，与未收口的 PATCH 通道（轮1#15）组合成任意服务端文件读取链"
+      },
+      {
+        "evidence": "services.py L152-155: `if ReviewAssignment.objects.filter(reviewer=user, task__in=related_tasks).exists(): return`——filter 无 assignment_status 条件。ReviewAssignment 有 INVITED/ACCEPTED/REVIEWED…/REJECTED/EXPIRED 等状态（models.py L68-75），reject_invitation 置 REJECTED、force_summarize/邀请过期置 EXPIRED 后记录仍保留，于是拒绝邀请的审稿人仍通过 download 与 check_metadata（返回 original_name、pdf_metadata_author 等匿名化敏感元数据）四类主体判定。同族缺口：forms/views.py L255-263 validate_references 对审稿人只查 `ReviewAssignment.objects.filter(task=task, reviewer=user).first()` 是否存在，连 ai_review 那样的状态检查都没有，REJECTED/EXPIRED 审稿人仍可提取稿件参考文献。",
+        "impact": "已拒绝邀请（或邀请过期、被强制汇总标记 EXPIRED）的审稿人永久保有该稿件全文下载权与元数据窥探权，且不随任务 DECIDED 终止；与修复自述「被分配审稿人」主体的业务语义相悖——本应撤销的访问权未撤销。files/test_p0_permission.py 的 setUp 只构造 ACCEPTED 分配，该分支未被测试覆盖。",
+        "location": "dev/backend/apps/files/services.py:152-155（同族：dev/backend/apps/forms/views.py:255-263）",
+        "severity": "严重",
+        "title": "check_download_permission 不校验 assignment_status：已拒绝/已过期/被标记 EXPIRED 的审稿人仍可下载稿件全文并读取 PDF 元数据作者名"
+      },
+      {
+        "evidence": "views.py L232-236: `if action_type == 'summarize': StateMachineService.handle_all_overdue(task, request.user, force_summarize=True)`——无 reason 必填、无 submitted_count>=1 校验、不 update EXPIRED，甚至无 task.status 检查。state_machine.py L173-177 以 reason='强制汇总：部分已提交后其余全部超时，编辑选择强制汇总' 调 execute_transition，validate_transition L65 `if not reason.startswith('强制')` 直接放行 REVIEWING→SUBMITTED。对比 force_summarize（L196-213）本轮新增的 reason 必填、≥1 份 SUBMITTED 意见、未提交者置 EXPIRED 三项校验全部缺席。",
+        "impact": "P0 修复宣称「force_summarize 按 AC-T-11 补全」，但同一状态转换存在第二个入口：0 份意见的 REVIEWING 任务可经 handle_overdue(action=summarize) 被推入 SUBMITTED，随后 generate_report 因无意见抛 ValueError、SUBMITTED 无任何合法出边，任务永久死锁且无法决策；AC-T-11 三要素被整体绕过。注：轮1 #62/#65 已报该端点缺前置校验，本条确认 P0 修复批（决策#012 第7条甚至特意为 handle_all_overdue 的 reason 统一加「强制」前缀以放行该路径）未收口姊妹通道，属修复旁路而非重复报告。",
+        "location": "dev/backend/apps/tasks/views.py:225-242（配合 dev/backend/apps/tasks/state_machine.py:164-182、62-70）",
+        "severity": "严重",
+        "title": "handle_overdue(action=summarize) 完整绕过本轮 P0 修复的 force_summarize AC-T-11 三要素：无原因必填、无≥1份已提交意见校验、不标记未提交者 EXPIRED"
+      },
+      {
+        "evidence": "serializers.py L80-84: `elif user.is_reviewer and instance.review_mode == 'DOUBLE_BLIND': data.pop('author_name', None); data.pop('author_email', None)`。review_mode 列在 fields（L44）但不在 read_only_fields（L51-52），partial_update 又无权限校验（轮1#15 未修复），被分配审稿人两步即可：PATCH /api/tasks/{id}/ {\"review_mode\":\"SINGLE_BLIND\"} → GET /api/tasks/{id}/，分支条件失效，author_name/author_email 原样返回。同通道下 publish_opinions_to_author（L48，可写）也可被作者自行翻转为 True 绕过 make_decision 的发布门控。",
+        "impact": "P0 批新增的 AC-T-13 双盲裁剪（决策#012 第9条）对「被分配且已接受的非编辑部用户」不成立：双盲承诺被一个 PATCH 击穿，审稿人可稳定获得作者姓名与邮箱；make_decision 的 publish 门控同样可被翻转。注：PATCH 缺口本身是轮1#15 已报未修问题，本条报告的是该缺口对本轮新防线（to_representation 裁剪 + publish 门控）的击穿路径。",
+        "location": "dev/backend/apps/tasks/serializers.py:80-84（配合 dev/backend/apps/tasks/views.py ReviewTaskViewSet 未覆写 partial_update）",
+        "severity": "严重",
+        "title": "双盲序列化裁剪可被 PATCH review_mode 绕过：审稿人把任务改成 SINGLE_BLIND 后 author_name/author_email 即回显，同一通道还可翻转 publish_opinions_to_author"
+      },
+      {
+        "evidence": "views.py L96-102: `user = authenticate(...)` 失败后 `user_obj = User.objects.get(email=email); if user_obj.check_password(password): user = user_obj`。Django ModelBackend 会拒绝 is_active=False 用户，兜底分支绕过该检查直接发 JWT（后续 API 被 SimpleJWT 的 is_active 校验拦住，但登录成功本身即绕过）。时序上：不存在邮箱→两次纯 DB 查询即返回（毫秒级）；存在邮箱+错密码→authenticate 与兜底各跑一次 PBKDF2 哈希（数百毫秒级），尽管错误文案统一为「邮箱或密码错误」，响应时间稳定区分邮箱是否存在。",
+        "impact": "攻击者可通过响应时间做用户枚举（与统一文案的防枚举意图相悖）；对存在邮箱的错误尝试双重哈希放大计算开销（无登录限流时叠加，限流已在决策#013备注为待排期，此处不重复报）；is_active 停用通道当前后端代码未使用（仅 Django admin 可停用），属潜伏缺陷——一旦启用停用机制，被停用账号仍可登录换取 token 与本人信息。",
+        "location": "dev/backend/apps/users/views.py:95-102",
+        "severity": "一般",
+        "title": "login 兜底分支绕过 Django is_active 门禁，且对存在邮箱执行两次密码哈希，形成时序型用户枚举"
+      },
+      {
+        "evidence": "L74-76: `accepted = task.assignments.filter(assignment_status__in=['ACCEPTED', 'OVERDUE']); submitted = accepted.filter(assignment_status='SUBMITTED').count()`——第二段在已限定 ACCEPTED/OVERDUE 的集合上再过滤 SUBMITTED，恒为 0，`if submitted > 0 and not reason.startswith('编辑选择回退')` 永不触发拦截。",
+        "impact": "「已有审稿人提交意见时 REVIEWING→PENDING 回退需编辑明确选择」的安全护栏是死代码，起不到兜底作用；当前唯一调用方 handle_overdue(rollback) 的 reason 恰好带「编辑选择回退」前缀故未暴露，但任何未来新增的回退调用（如定时任务代决）都会绕过该护栏无声回退已提交意见的任务。",
+        "location": "dev/backend/apps/tasks/state_machine.py:72-79",
+        "severity": "一般",
+        "title": "validate_transition 对 REVIEWING→PENDING 的「已有提交意见需编辑明确选择」护栏因链式过滤 bug 恒为死代码"
+      },
+      {
+        "evidence": "L290-293: `if report and report.recommendation_distribution: for rec, count in report.recommendation_distribution.items(): if count > 0: tags.append(rec)`——aggregate_opinions 生成的分布为 {'ACCEPT':n,'MINOR_REVISION':n,'MAJOR_REVISION':n,'REJECT':n,'total':n}（summaries/services.py L138-144），'total' 键的 count 恒>0，被当作推荐类型追加。",
+        "impact": "每条有意见归档的 KnowledgeItem.tags 都混入无意义标签 'total'，污染检索/筛选口径（前端 KnowledgeSearch 按 tags 渲染标签）；决策#012 第8条宣称「_generate_tags 键名对齐汇总报告真实结构」但漏掉了 total 键。",
+        "location": "dev/backend/apps/knowledge/services.py:290-293",
+        "severity": "一般",
+        "title": "_generate_tags 把 recommendation_distribution 的 'total' 键当推荐类型遍历，每条归档都生成无意义标签 'total'"
+      },
+      {
+        "evidence": "L215-216: `dim_name = cp.get('dimensionName', ...); parts.append(f'  {dim_name}: {cp.get(\"description\", \"\")}')`——而 analyze_consensus（summaries/services.py L317-328）输出键为 type/typeLabel/avgScore/distributionText，无 'description'，渲染恒为「创新性: 」空串。test_anonymization.py L196 只断言 `self.assertIn('一致点', summary)`（仅章节标题），描述为空也通过。",
+        "impact": "轮1（一般项「归档文本…分歧一致点为空串」）在本次修复中只对齐了维度与分歧点键名，一致点描述仍恒空，属修复残留；且该测试构成「测了但断言宽松」的假覆盖，绿灯掩盖缺陷。",
+        "location": "dev/backend/apps/knowledge/services.py:210-216（测试：dev/backend/apps/knowledge/test_anonymization.py:196）",
+        "severity": "一般",
+        "title": "anonymized_summary 一致点渲染键名仍错位（读 description，实际键为 distributionText/typeLabel），描述恒为空串；新增测试只断言章节标题存在，构成宽松断言假覆盖"
+      },
+      {
+        "evidence": "L135-136: `request.user.set_password(...); request.user.save(update_fields=['password','updated_at'])`，无任何 token 黑名单/轮换；UserAdminSerializer.update（serializers.py L38-45）重置密码同样不失效旧 token。settings.py SIMPLE_JWT：ACCESS_TOKEN_LIFETIME=12h、REFRESH_TOKEN_LIFETIME=7d，未配置 blacklist app。",
+        "impact": "会话/令牌被盗后用户改密无法止损：攻击者持有的 access token 在最长 12 小时内、refresh token 在 7 天内继续完全可用，与「防会话劫持后改密」的修复注释目标（serializers.py L76）相悖。决策#013 已把 refresh 轮换列为待排期，本条确认改密/重置两处均未做失效。",
+        "location": "dev/backend/apps/users/views.py:130-137（编辑部通道同：dev/backend/apps/users/serializers.py:38-45）",
+        "severity": "一般",
+        "title": "change_password 与编辑部重置密码均不失效已签发的 JWT，改密后旧令牌在 access 12h/refresh 7d 内继续有效"
+      },
+      {
+        "evidence": "delete_file 权限仅「上传人或编辑部」，全函数无对 ReviewTask.manuscript_file 的引用检查即 `os.remove(abs_path)` 并 `uploaded_file.delete()`。典型链路是作者上传稿件、编辑部建任务引用该 file_path，作者（=上传人）在任务 REVIEWING/SUBMITTED 期间随时可 DELETE /api/files/{id}/。",
+        "impact": "审稿中稿件被上传人单方面抹除（磁盘+记录），任务页下载 404、AI 审稿/参考文献验证 FileNotFoundError、后续 DECIDED 归档只能拿到空维度数据，且 UploadedFile 记录删除后无法追溯；文件删除接口（files/test_p0_permission.py 无任何 destroy 测试）与「文件生命周期由业务流程管理」的注释（views.py L29）口径不一致。",
+        "location": "dev/backend/apps/files/services.py:270-305",
+        "severity": "一般",
+        "title": "delete_file 不检查文件是否被进行中任务引用：上传人（通常是作者）可随时删除已挂接审稿任务的稿件，磁盘文件与记录一并消失"
+      },
+      {
+        "evidence": "apps/knowledge 下仅 test_anonymization.py（纯服务层单元测试），grep 全库无任何测试请求 /api/knowledge/search|detail|pending_reviews|review|export——本轮修复涉及的知识库可见范围（作者 403、审稿人仅 APPROVED、编辑部全量）零 API 级断言；files/test_p0_permission.py 的 setUp 只造 ACCEPTED 分配，未测 REJECTED/EXPIRED 分配、未测 destroy；tasks/test_p0_fixes.py 未测 update/partial_update/destroy（恰是未收口面）与 handle_overdue 的 AC-T-11 路径。",
+        "impact": "权限矩阵回归靠人工：后续重构（如补 #15/#16 修复时改动 get_queryset 或序列化器）没有测试护栏，本轮已发现的 REJECTED 下载、handle_overdue 旁路即处于该盲区；决策#012 宣称的 47 项新回归测试对知识库 API 层为 0 覆盖。",
+        "location": "dev/backend/apps/knowledge/（无端点测试）；dev/backend/apps/files/test_p0_permission.py；dev/backend/apps/tasks/test_p0_fixes.py",
+        "severity": "一般",
+        "title": "P0 修复批的测试覆盖缺口：知识库五个端点的权限矩阵后端零 API 测试；files 未测 REJECTED/EXPIRED 分配与删除权限；tasks 未测默认 CRUD 与 handle_overdue 通道"
+      },
+      {
+        "evidence": "L106: `operator_type='EDITOR' if operator_user else 'SYSTEM'`——accept_invitation/reject_invitation 由审稿人触发（views.py L144-146 传入 user），StateLog.OperatorType 仅 SYSTEM/EDITOR 两值（models.py L129-131），审稿人动作一律落为 EDITOR。",
+        "impact": "审计链把审稿人操作记为编辑部操作，AC-T-04「所有状态变更可追溯」在操作者类型维度失真；P1 批的 state_logs 脱敏被迫改为按 operator_user_id∈分配集合反推（决策#013 第18条自认此 quirk），该 workaround 又导致编辑部用户兼任审稿人时其编辑部操作也被标成「审稿人」。属已知晓但未修复的数据质量问题，供排期参考。",
+        "location": "dev/backend/apps/tasks/state_machine.py:106",
+        "severity": "建议",
+        "title": "审稿人触发的状态转换 operator_type 恒写 'EDITOR'，审计日志把审稿人动作记为编辑部操作，脱敏只能按分配集合反推"
+      },
+      {
+        "evidence": "L216-220: `x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR'); if x_forwarded_for: ip = x_forwarded_for.split(',')[0].strip()`——客户端可在请求头任意伪造首段。",
+        "impact": "知识库访问审计（对应 PRD §3.1.11 access_logs）的 IP 字段可被任意污染，异常访问溯源（谁批量枚举 knowledge_id）不可信。",
+        "location": "dev/backend/apps/knowledge/views.py:213-221",
+        "severity": "建议",
+        "title": "_get_client_ip 无条件信任 X-Forwarded-For 首段，AccessLog 的审计 IP 可被客户端伪造"
+      },
+      {
+        "evidence": "L139: `response['Content-Disposition'] = f'attachment; filename=\"{original_name}\"'`——original_name 为用户上传文件名，含双引号时可闭合再注入额外参数（如 filename=\"a.pdf\"; filename=\"evil.exe\"），含 CRLF 会被 Django BadHeaderError 拦成 500；中文文件名经 Django 头部 latin-1/mime 编码后浏览器不解码。",
+        "impact": "低危：可注入额外 Content-Disposition 参数制造混乱、非预期 500；注释宣称「支持中文」实际中文文件名在浏览器侧显示为编码乱码，应改用 RFC 5987（filename*=UTF-8''…）并对引号转义。",
+        "location": "dev/backend/apps/files/views.py:139",
+        "severity": "建议",
+        "title": "download 的 Content-Disposition 直接拼接用户可控的 original_name：引号未转义、中文未按 RFC 5987 编码"
+      },
+      {
+        "evidence": "UserCreateSerializer.create L69: `user.set_password(password or 'changeme123')`（users/tests.py 亦断言该默认值）；ChangePasswordSerializer L78-81 仅 min_length=8；settings.py 配置的 AUTH_PASSWORD_VALIDATORS（相似度/常见密码/纯数字）在 create/change_password/UserAdminSerializer 三条通道均未调用 validate_password。",
+        "impact": "新建账号在被本人首次登录前存在公开已知口令窗口（叠加无登录限流可被第三方抢先登录冒充）；新密码可为纯数字/常见口令，密码强度策略形同虚设。默认口令属有意设计（help_text 已注明），但缺首登强制改密兜底。",
+        "location": "dev/backend/apps/users/serializers.py:65-72、78-81",
+        "severity": "建议",
+        "title": "账号安全策略缺口：编辑部建号默认密码 changeme123 且无首次登录强制改密；AUTH_PASSWORD_VALIDATORS 未在任何 API 通道生效"
+      },
+      {
+        "evidence": "L82-84: `reviewers = User.objects.filter(user_id__in=reviewer_ids, roles__contains=['REVIEWER'])`，仅校验 REVIEWER 角色，未排除 `task.author_user_id`；roles 为多值 JSONField，作者可同时具备 REVIEWER 角色。",
+        "impact": "编辑部误操作（或前端自动推荐）即可把作者本人分配为其稿件的审稿人：作者拿到自己稿件的审稿入口，双盲在语义上自我瓦解，且该用户在 state_logs 脱敏判定中会同时命中作者与审稿人集合。待核实：PRD 是否要求硬性禁止（建议至少加服务端防线）。",
+        "location": "dev/backend/apps/tasks/views.py:82-84",
+        "severity": "建议",
+        "title": "assign_reviewers 不排除稿件作者本人，兼具 REVIEWER 角色的作者可被分配审阅自己的稿件，双盲/利益冲突防线缺失"
+      }
+    ],
+    "checked_ok": [
+      "UserViewSet 六个默认 CRUD 动作逐一核对完毕：list/create/update/partial_update/destroy 均有 is_editor 前置 403，retrieve 放行编辑部或本人（user_id 与 URL pk 同为字符串可直接比较），无遗漏动作；settings.py DEFAULT_PERMISSION_CLASSES=IsAuthenticated 兜底，login 之外无匿名可达动作",
+      "UserProfileSerializer 白名单外未发现其他本人写入通道：update/partial_update 走 UserAdminSerializer 且先过编辑部校验，update_profile 仅 name/institution/research_areas 三字段，roles/email/password 均不可经个人通道篡改（test_p0_security.py 有字段级断言）",
+      "change_password 旧密码校验无法以空串或 None 绕过：DRF CharField 默认拒绝 blank/null，validate_old_password 内 check_password 失败即 400；新密码 min_length=8 生效（有回归测试）",
+      "UserSerializer 全字段只读，UserAdminSerializer 的 password 为 write_only 且响应不回显（测试断言 assertNotIn('password')）；空字符串密码不会触发重置（if password: 分支）",
+      "文件 check_metadata 与 download 权限口径确实一致：两者均调用同一个 FileService.check_download_permission，且权限判定先于磁盘存在性检查（无关者 403、有权者因文件缺失得 404，测试覆盖了这一区分）",
+      "check_download_permission 对 author_user_id 判定无空值漏洞：ReviewTask.author_user_id 为非空外键不可能为 None；uploaded_by 为 SET_NULL 时 uploaded_by_id=None 与任何 user_id 比较均为 False，不会误放行",
+      "文件上传无路径穿越：存储路径由服务端时间戳前缀+原文件名生成，原文件名中的 ../ 会因中间目录不存在导致 open 抛 IOError 被 ValueError 捕获，写入不会逃出 MEDIA_ROOT；download/check_metadata 只使用 DB 中服务端生成的 file_path，不使用任务上的 manuscript_file",
+      "task_opinions 组合门控成立：作者分支依次校验归属（他人稿件 403）、状态（仅 SUMMARIZED/DECIDED）、publish_opinions_to_author，输出经 anonymize_opinion 移除 reviewer/reviewer_name/reviewer_email/assignment 四键；编辑部全量、审稿人与无角色用户 403（test_p0_idor.py 四象限齐备）",
+      "my_opinion 仅返回本人意见（reviewer=user 过滤）；get_form 审稿人需分配记录且状态 ∈ ACCEPTED/REVIEWING/SUBMITTED，作者限本人稿件，无角色用户 403；submit 校验分配状态与同轮重复提交，意见与 assignment 绑定 reviewer=user 无法替他人提交",
+      "知识库 auto_anonymize 数据链路逐字段核查无身份残留：anonymized_dimensions 经 _strip_identity_keys 递归脱敏 dimension_comparison.scores、anonymized_recommendations 为纯计数、template_info.dimensions 复用脱敏后数据、tags/keywords 来源于任务字段（无审稿人身份）、anonymized_summary 维度只渲染分值数字、overall_comments 只渲染文本并按审稿人A/B 编号；含 reviewerName/reviewerId 的 revision_suggestions_summary 未进入知识库写入路径",
+      "_strip_identity_keys 的 IDENTITY_KEYS（camelCase+underscore 双口径共 6 键）与 SummaryService.aggregate_opinions 实际产出的身份键（reviewerId/reviewerName）完全对得上，未发现第三种键名变体穿透",
+      "知识库可见范围：search/detail 在视图层即拒绝纯作者与无角色用户（403），服务层再对非编辑部审稿人限 APPROVED 条目；pending_reviews/review_anonymization/export 均仅编辑部；export 输出确不含 source_task_id",
+      "state_logs 脱敏本体成立：非编辑部视角下 operator_user_id ∈ 任务分配集合的日志 operator_name 改为「审稿人」，operator_user 为 None 的系统日志默认「系统」不受影响；StateLogSerializer 不暴露 operator_user 外键值，trigger_reason 各调用点文案均不含姓名；无关作者访问他人任务日志 404（有测试）",
+      "make_decision 先 save(update_fields=[final_decision,decision_notes,publish_opinions_to_author]) 再 execute_transition，决策字段真实落库并有 GET 接口复测；已 DECIDED 任务二次决策被 400 拒绝；auto_anonymize 归档失败仅告警不阻断主流程",
+      "通知链路无审稿人身份外泄：含审稿人姓名/邮箱的通知（accept/reject/submit/overdue）仅发给编辑部用户，作者收到的通知（受理/决策）只含决策与说明；通知接口 get_queryset 严格限定本人",
+      "ReviewOpinionViewSet/ReviewFormViewSet 为 GenericViewSet 且仅注册自定义 action，无默认 CRUD 路由暴露；FileViewSet 的 http_method_names 不含 put/patch，list/retrieve 已显式禁用",
+      "汇总报告全部端点（list/retrieve/detail/generate/match_rule_preview）均有编辑部前置校验，作者无法经汇总报告路径获取 dimension_comparison/overall_comments 中的审稿人身份"
+    ]
+  },
+  {
+    "dimension": "contract",
+    "findings": [
+      {
+        "evidence": "ReviewForm.vue:307 `await formApi.submit(buildPayload())`，紧随其后 311-313 行 `} catch (e) { // handled by interceptor }` 为空捕获；而 api/modules.js:59-63 formApi 仅定义 `submitOpinion: (data) => api.post('/opinions/submit/', data)`，全文件不存在 submit 方法。决策 #013 第 7 条宣称「ReviewForm：…buildPayload 输出 {task_id, dimension_scores…}」已完成对齐且验证节宣称「E2E 冒烟 22 项断言通过」，但 `formApi.submit` 是运行时属性访问，`npm run build` 无法发现，E2E 显然未走 UI 提交按钮路径。",
+        "impact": "审稿人在审稿表单点「确认提交」后，confirmSubmit 同步抛出 TypeError: formApi.submit is not a function，未发出任何 HTTP 请求即被空 catch 吞掉——无报错提示、无网络请求、对话框不关闭、按钮 loading 闪烁即止。审稿人提交审稿意见这一核心主流程从 UI 上 100% 不可用且完全静默，审稿人无从得知失败原因。这是 P1 前端对齐批（决策 #013）引入/暴露的回归，直接推翻其「全链路 E2E 通过」的验证结论。",
+        "location": "dev/frontend/src/views/review/ReviewForm.vue:307",
+        "severity": "致命",
+        "title": "审稿人提交意见调用不存在的 formApi.submit 方法，提交主流程完全不可用且静默失败"
+      },
+      {
+        "evidence": "TaskCreate.vue:47 `<el-input v-model=\"form.abstract\" type=\"textarea\" :rows=\"4\" placeholder=\"论文摘要（选填）\" />`，185 行初始化 `abstract: ''`，且该字段无 required 校验规则；后端 tasks/models.py:22 `abstract = models.TextField('稿件摘要', max_length=2000)` 无 blank=True，ReviewTaskCreateSerializer（serializers.py:92 fields 含 'abstract'）无 extra_kwargs 豁免，ModelSerializer 自动生成 required+not_blank 校验。",
+        "impact": "编辑部按界面提示（选填）不填摘要直接创建任务 → 后端 400 {\"abstract\": [\"该字段是必填项。\"]}；api/index.js:40 拦截器对 400 只读 detail/error 键 `ElMessage.error(response.data?.detail || response.data?.error || '请求参数错误')`，该字段级错误两个键都不存在，用户只看到笼统的「请求参数错误」，无法定位原因，创建任务主流程受阻且排障困难。",
+        "location": "dev/frontend/src/views/tasks/TaskCreate.vue:47",
+        "severity": "严重",
+        "title": "摘要字段前端标「选填」默认空串，后端模型无 blank=True 必填校验，空摘要创建任务必返 400"
+      },
+      {
+        "evidence": "settings.py:138-139 `'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination', 'PAGE_SIZE': 20` 未配置 page_size_query_param；NotificationList.vue:89 `await notificationApi.list({ page_size: 50 })`、Dashboard.vue:197 `await notificationApi.list({ page_size: 5 })` 的 page_size 均被 DRF 静默忽略，固定返回 20 条。",
+        "impact": "通知中心组件无任何翻页控件，用户通知超过 20 条时第 21 条及以后在 UI 上永远不可达（数据存在但无入口），属于静默数据不可见；Dashboard「最近通知」想显示 5 条实得 20 条，时间线展示超长。两处均为 P1 对齐批未覆盖的契约盲点。",
+        "location": "dev/backend/review_platform/settings.py:138",
+        "severity": "一般",
+        "title": "全局分页器不识别 page_size 查询参数，通知中心实取 20 条且无翻页入口，第 21 条起的通知在界面上不可达"
+      },
+      {
+        "evidence": "TaskCreate.vue:274 `const res = await userApi.list()` 后客户端过滤 `users.filter(u => (u.roles || []).includes('AUTHOR'))`，userApi.list 命中 /users/ 分页端点（PAGE_SIZE=20）；SummaryList.vue:104 `const res = await taskApi.dashboard({ status: 'SUBMITTED' })` 同样只取第一页。",
+        "impact": "系统用户超过 20 人时，第 21 位及以后的作者账号在创建任务的作者下拉中不存在、无法被选中（静默缺失，编辑部不会察觉）；SUBMITTED 待汇总任务超过 20 个时，生成汇总报告对话框看不到第 21 个及以后的任务，这些任务无法从 UI 发起汇总。",
+        "location": "dev/frontend/src/views/tasks/TaskCreate.vue:274",
+        "severity": "一般",
+        "title": "下拉数据源只取分页接口第一页 20 条：作者选择器与生成汇总任务选择器均静默丢失超出部分"
+      },
+      {
+        "evidence": "Dashboard.vue:187 `archived: countBy('ARCHIVED')`，而后端 ReviewTask.Status choices 仅 PENDING/ASSIGNED/REVIEWING/SUBMITTED/SUMMARIZED/DECIDED，不存在 ARCHIVED；utils/status.js:13-14 TASK_STATUS 仍含 `ARCHIVED: { label: '已归档' …}` 与 `REJECTED: { label: '已拒稿' …}`。决策 #013 第 1 条只对齐了 RECOMMENDATION 与 ASSIGNMENT_STATUS，TASK_STATUS 词表漏改。",
+        "impact": "作者仪表盘「已归档」统计卡永远显示 0（展示虚假统计）；TaskList 状态筛选下拉含 ARCHIVED/REJECTED 两个死选项，选中后结果恒为空，误导用户以为筛选功能损坏。",
+        "location": "dev/frontend/src/views/Dashboard.vue:187",
+        "severity": "一般",
+        "title": "作者仪表盘 ARCHIVED 统计恒为 0，utils/status.js TASK_STATUS 残留 ARCHIVED/REJECTED 死键——P1 词表对齐漏掉任务状态表"
+      },
+      {
+        "evidence": "KnowledgeSearch.vue:142-144 `<el-table-column prop=\"avg\" label=\"均分\" width=\"80\" align=\"center\"><template #default=\"{ row }\">{{ row.avg ?? '-' }}</template>`；而后端 knowledge/services.py _build_anonymized_dimensions 返回 _strip_identity_keys(report.dimension_comparison)，元素结构为 {dimensionId, dimensionName, scores:[{opinionId, score, comment}]}，不存在 avg 键（服务代码注释本身也写明报告无 avg 键）。",
+        "impact": "知识库详情弹窗「均分」列所有行恒显示 '-'，历史稿件的维度平均分信息在 UI 上不可见，知识库检索的量化参考价值受损（数据在库中存在）。",
+        "location": "dev/frontend/src/views/knowledge/KnowledgeSearch.vue:143",
+        "severity": "一般",
+        "title": "知识库详情对话框读取 anonymized_dimensions 中不存在的 avg 键，「均分」列恒为 '-'"
+      },
+      {
+        "evidence": "TaskList.vue:149 注释「dashboard 端点支持 status/subject 服务端筛选；keyword 前端过滤」；154-160 行 `const kw = filters.keyword.toLowerCase(); rows = rows.filter(t => (t.title||'').toLowerCase().includes(kw) || (t.task_id||'').toLowerCase().includes(kw))` 仅作用于当页 results；161 行 `total.value = res.count || rows.length` 在过滤后仍取全量 count。",
+        "impact": "搜索命中其他页的任务时当前页过滤后显示「无数据」，用户误以为任务不存在；且过滤后列表行数与分页 total 不一致（如 count=100 只显示 3 行），分页行为不可预期。跨页检索能力实质缺失。",
+        "location": "dev/frontend/src/views/tasks/TaskList.vue:154",
+        "severity": "一般",
+        "title": "关键字搜索仅对当前页 20 条做客户端过滤，跨页匹配静默丢失且分页总数与过滤结果矛盾"
+      },
+      {
+        "evidence": "MyArticles.vue:131-136 `const res = await taskApi.myArticles({ page: currentPage.value, page_size: pageSize.value })`；而后端 tasks/views.py my_articles action 直接返回 {'count':…, 'results': 全量 queryset}，不消费任何分页参数（与 my_tasks 同为非分页端点）。",
+        "impact": "稿件数量增长后每次全量拉取（性能隐患）；界面翻页器可点击但切换页码数据不变，交互上误导用户；与 MyTasks（同为 my_* 端点）行为一致但界面却提供了翻页控件，契约呈现不真实。",
+        "location": "dev/frontend/src/views/tasks/MyArticles.vue:131",
+        "severity": "建议",
+        "title": "MyArticles 假分页：page/page_size 参数发送但 my_articles 端点不消费，全量渲染却配可点击的翻页控件"
+      },
+      {
+        "evidence": "OpinionView.vue:94-99 formatDimensionScores 中 `name: item.dimensionName || item.dimensionId`——作者视角走匿名化 dimension_scores_detail 载荷，仅含 dimensionId/score/comment，无 dimensionName，故 name 恒回退为 dimensionId（如 'D1'）。",
+        "impact": "作者查看自己稿件的审稿意见时，各维度标题显示 'D1'/'D2' 等机器代码而非「创新性」「学术规范性」等中文名，可读性差；数据本身未丢失（评语评分正常显示）。",
+        "location": "dev/frontend/src/views/review/OpinionView.vue:97",
+        "severity": "建议",
+        "title": "作者视角维度名缺失时回退显示 dimensionId 机器代码（如 D1），可读性差"
+      },
+      {
+        "evidence": "NotificationList.vue:55-64 getIconName 的 map 键为 `ASSIGN/ACCEPT/REJECT/SUBMIT/SUMMARIZE/DECISION/OVERDUE/SYSTEM`；而后端通知类型枚举为 TASK_CREATED/INVITATION/ACCEPT/REJECT/SUBMIT/SUMMARIZE/DECIDE/REMIND/OVERDUE，其中 ASSIGN、DECISION、SYSTEM 三个键后端不存在（实际是 INVITATION/DECIDE/TASK_CREATED/REMIND），命中后走 `map[type] || 'Bell'` 兜底。",
+        "impact": "全部通知图标恒为默认铃铛、颜色恒为灰色，通知类型的视觉区分完全失效（有兜底不报错、不崩溃）；属于轮1 #35 部分修复后的残留未对齐项。",
+        "location": "dev/frontend/src/components/NotificationList.vue:55",
+        "severity": "建议",
+        "title": "通知图标/颜色映射键位与后端通知类型枚举不一致，恒回退默认铃铛图标"
+      }
+    ],
+    "checked_ok": [
+      "【路由全量对齐】以括号深度解析器逐一比对 api/modules.js 全部方法与后端 7 个 app 的 urls.py 注册：路径、HTTP 方法、@action url_path 全部匹配，唯一断裂为 formApi.submit（见致命发现），其余 40+ 方法定义无缺失/无拼错",
+      "【P0-1 复核通过】UserViewSet CRUD 收口未被绕过：list/update/partial_update/destroy 仅 EDITOR（403），retrieve 限编辑部或本人，login 保持匿名开放（users/views.py）",
+      "【P0-2 复核通过】双通道序列化器：响应 UserSerializer 身份/角色字段全只读；update_profile 走 UserProfileSerializer 白名单 {name,institution,research_areas}，roles/email 无法经个人通道篡改；编辑部通道 UserAdminSerializer 可调角色/邮箱",
+      "【P0-2 复核通过】change_password 动作校验旧密码 + 新密码≥8位，端点存在且逻辑正确（但前端无任何调用方，见建议级清单）",
+      "【P0-3 复核通过】task_opinions IDOR 修复无绕过：queryset 按 task 归属过滤，作者越权查他人稿件意见返回 403",
+      "【P0-4 复核通过】文件下载与 check_metadata 同口径走 FileService.check_download_permission 对象级权限（编辑部/上传人/稿件作者/被分配审稿人四类放行，其余 403）",
+      "【P0-5 复核通过】make_decision 先 save(update_fields=[final_decision,decision_notes,...]) 再 execute_transition，转状态内部 select_for_update 重取行不再丢弃决策字段",
+      "【P0-6 复核通过】DECIDED 自动触发 AnonymizationService.auto_anonymize，归档失败仅告警不阻断决策",
+      "【P0-7 复核通过】force_summarize 按 AC-T-11：原因必填、≥1 份已提交意见、未提交审稿人置 EXPIRED；状态机 handle_all_overdue 强制路径 reason 带「强制」前缀，能通过 REVIEWING→SUBMITTED 的 reason.startswith('强制') 哨兵校验",
+      "【P0-8 复核通过】知识库 _strip_identity_keys 递归移除 camelCase/underscore 双口径身份键（reviewerId/reviewerName 等），anonymized_dimensions 无身份键残留；_build_anonymized_summary/_generate_tags 键名与汇总报告真实结构对齐",
+      "【P0-9 复核通过】ReviewTaskSerializer.to_representation 双盲裁剪：作者任何模式不见审稿人身份字段，双盲审稿人不见作者姓名/邮箱，编辑部全量",
+      "【P1-18 复核通过】state_logs 非编辑部视角按 operator_user_id∈分配集合判定，审稿人操作者 operator_name 脱敏为「审稿人」，作者经状态日志窥探审稿人姓名的旁路已封堵",
+      "【P1-19 复核通过】SummaryReportBriefSerializer 已补 task_title，SummaryList 列渲染 task_title 正常；SummaryList/SummaryDetail 与 brief/完整序列化器逐字段比对全部对齐（dimension_comparison、conflict_points levelLabel/distributionText/maxScore/minScore、consensus_points typeLabel/avgScore、system_recommendation matchedRuleId/conclusion/advisoryOnly、by_dimension 归组）",
+      "【P1-1 复核通过】utils/status.js RECOMMENDATION（ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT）与 ASSIGNMENT_STATUS（INVITED/ACCEPTED/REVIEWING/SUBMITTED/REJECTED/EXPIRED/OVERDUE）与后端枚举一致（TASK_STATUS 残留死键另报）",
+      "【P1-3 复核通过】TaskCreate 提交载荷键位（title/keywords/subject_area/template_id/manuscript_file 取上传响应 file_path/author 用 user_id）与 ReviewTaskCreateSerializer 字段全部匹配（abstract 必填矛盾另报）",
+      "【P1-4 复核通过】TaskAssign reviewer_user_ids 取 user_id、检索参数 subject 与后端 dashboard 过滤参数匹配；审稿人表机构/研究领域列与序列化器输出键一致",
+      "【P1-5 复核通过】TaskDecision payload {decision,notes,publish} 与 make_decision 请求字段匹配；系统建议从 system_recommendation.matchedRuleId 解析（Rule-1/2→接收、3→小修、5→大修、6→拒稿、4/7→分歧）与后端 Rule 结构一致",
+      "【P1-6 复核通过】TaskList 改用 dashboard 端点，status/subject 服务端筛选参数后端确实消费（keyword 前端过滤问题另报）；TaskDetail assignments 与时间线键位（log_id/from_state/to_state/operator_name/trigger_reason）、终审卡 final_decision/decision_notes 对齐",
+      "【P1-7 复核通过】ReviewForm buildPayload 输出 {task_id, dimension_scores[{dimensionId,score,comment}], recommendation, overall_comment, revision_suggestions[]} 与后端 OpinionSubmitSerializer 请求结构完全匹配（仅提交调用方法名断裂，见致命发现）；草稿恢复双向转换正确",
+      "【P1-8 复核通过】MyTasks 数据模型为分配记录，assignment_status 分组与后端 my_tasks 返回结构一致；接受/拒绝走任务动作接口与后端路由匹配",
+      "【P1-9 复核通过】MyArticles/ArticleProgress task_id 路由、审稿进度从 assignments 现算、作者视角保留 assignment_status 仅隐身份，与 ReviewTaskSerializer 裁剪逻辑吻合",
+      "【P1-10 复核通过】OpinionView 意见键位 opinion_id/dimension_scores(_detail)/revision_suggestions、推荐标签色键 color 修复有效",
+      "【P1-13 复核通过】KnowledgeSearch 检索参数 subject_area/final_decision/score_range(high|mid_high)/月份区间与后端实现完全对齐；is_cold_start/cold_start_guide 按真实结构渲染",
+      "【P1-14 复核通过】KnowledgeReview 队列列对齐 KnowledgeItemSerializer（source_task_id/anonymization_status_display/pending_review_segments 计数）；待审核段 {label,matched,context,line} 渲染；审核提交 {decision:APPROVED/REJECTED/PERMANENTLY_EXCLUDED, notes} 为后端识别的正确载荷",
+      "【P1-15 复核通过】TemplateList 键位 template_name/subject_area/status(ACTIVE)、维度编辑 {dimensionId,dimensionName,description,minWords} 与 TemplateSerializer 对齐，维度 ID 唯一校验存在",
+      "【P1-16 复核通过】Profile research_areas 多选中文词表、注册时间 created_at、提交白名单 {name,institution,research_areas} 与 UserProfileSerializer 一致",
+      "【P1-17 复核通过】Dashboard 编辑部角色翻页取全 dashboard 后现算统计（无页数截断）；审稿人角色按 my_tasks 分配状态现算正确；NotificationList markRead 传 notification_ids 与后端动作匹配；markAllRead 路由匹配",
+      "【RefValidation 复核通过】formApi.validateReferences 与后端 @action 路由匹配；结果键 total/verified/partial_match/mismatch/not_found/results[].status/input/exists/title/authors/year/journal/doi/citations/retracted/issues/match_confidence/source 与后端响应结构逐键一致；四态枚举 verified/partial_match/mismatch/not_found 与后端一致",
+      "【登录链路】login 请求 {email,password} 与后端匹配，响应 token/access_token/refresh_token/user 消费正确；路由守卫与 401 拦截器登出链路正常",
+      "【无消费者端点清单（建议级，非缺陷）】users change_password（P0 新增，modules.js 无方法、无 UI）；taskApi.handleOverdue（轮1 #41 已立案）；fileApi.download（轮1 #42 已立案）/ fileApi.delete；summaryApi.matchRulePreview；knowledgeApi.export；users CRUD（create/update/destroy/retrieve，无编辑部用户管理界面）；taskApi.list/update；templateApi.retrieve；notifications retrieve——均已核实确实无前端调用方，不重复立案",
+      "【轮1 已立案不重报】score_range 后端 JSON contains 恒空匹配、登录限流缺失、refresh_token 无挂载端点、CORS 放宽等均为轮1 报告既有条目，本轮复核确认状态未变化，未重复计入 findings"
+    ]
+  },
+  {
+    "dimension": "state-machine",
+    "findings": [
+      {
+        "evidence": "handle_overdue 的 summarize 分支仅两行：`StateMachineService.handle_all_overdue(task, request.user, force_summarize=True)`，全程不查 ReviewOpinion。而 handle_all_overdue 内部以 reason='强制汇总：部分已提交后其余全部超时，编辑选择强制汇总' 调 execute_transition，validate_transition 的放行条件是 `if not reason.startswith('强制')`（state_machine.py:65）——reason 以「强制」开头即完全跳过未提交人数检查，无任何意见数门槛。对比 P0 修复后的 force_summarize（views.py:201-208）已有 `submitted_count = ReviewOpinion.objects.filter(task=task, status='SUBMITTED').count(); if submitted_count < 1: return 400`。generate_report（summaries/services.py:472-473）则 `if not opinion_ids: raise ValueError(f'任务 {task.task_id} 无已提交的审稿意见，无法生成汇总报告')`，且 VALID_TRANSITIONS 中 SUBMITTED 的唯一出边是 SUMMARIZED。",
+        "impact": "全部审稿人超时且 0 份意见提交（正是 PRD 规定系统应自动回退 PENDING 的场景）时，编辑一旦在该任务上调 action=summarize，任务即进入 SUBMITTED 且无任何合法出边：generate 恒 400（ValueError），任务永久卡死，终审流程不可达，只能靠改库或删任务（级联删意见与报告）恢复。这是轮1 #62 所指双入口死局中未被 P0 修复封堵的另一半入口，构成对已实施修复的旁路。",
+        "location": "dev/backend/apps/tasks/views.py:234",
+        "severity": "严重",
+        "title": "handle_overdue?action=summarize 绕过 P0 修复新增的 AC-T-11「至少1份已提交意见」校验，0 份意见任务可转入 SUBMITTED 后永久死局"
+      },
+      {
+        "evidence": "rollback 分支仅 `StateMachineService.handle_all_overdue(task, request.user, force_summarize=False); StateMachineService.increment_retry_count(task)`，只改 task.status，不触碰任何 ReviewAssignment。aggregate_opinions（summaries/services.py:70-76）聚合条件是 `ReviewOpinion.objects.filter(task=task, status='SUBMITTED', round=1)`，无任何批次/时间界标，回退前提交的历史意见照常入选；check_and_transition_on_submit 的参与人集合 `assignment_status__in=['ACCEPTED','REVIEWING','SUBMITTED']` 同样包含回退时残留的旧 ACCEPTED 分配；force_summarize 的 ≥1 份校验（views.py:201-203）也只按 task+SUBMITTED 统计，历史意见即可满足。全代码库 round 恒写死 1（forms/views.py:420、548，PRD C-07 仅预留字段但未区分回退批次）。",
+        "impact": "PRD C-01 选项 B 明确回退后已提交意见「保留为历史记录」、编辑重新分配——实现上旧轮数据并未与新一轮隔离：(a) 被放弃轮次的 SUBMITTED 意见与新一轮意见一起进入汇总报告与规则引擎分布（如旧轮 1 拒稿 + 新轮 2 接收会被判 Rule-7 严重分歧），编辑据被污染的报告做终审决策；(b) 回退时仍在期的旧 ACCEPTED 审稿人若不再提交，新一轮全员提交后 not_submitted 恒 ≥1，任务永不自动转 SUBMITTED，直到旧分配 deadline 过期被 cron 标 OVERDUE 才解除；(c) 新一轮尚无任何意见时，编辑强制汇总可被上一轮历史意见满足校验，产出仅含废弃意见的汇总报告。轮1 #65 已覆盖「健康任务可被回退」入口本身，本条为其在合法超时回退路径上的数据后果，未重复报告。",
+        "location": "dev/backend/apps/tasks/views.py:237",
+        "severity": "严重",
+        "title": "回退待分配（rollback）不清退分配状态且 round 恒为 1，旧轮残留数据污染新一轮：历史意见混入汇总与规则引擎，残留 ACCEPTED 阻塞自动转 SUBMITTED"
+      },
+      {
+        "evidence": "`remaining = task.assignments.filter(assignment_status='INVITED').count(); accepted = task.assignments.filter(assignment_status='ACCEPTED').count(); if remaining == 0 and accepted == 0:` —— 计数查询基于普通读，未加锁（全库 select_for_update 仅存在于 state_machine.py 的任务行三处）。两位最后的 INVITED 审稿人并发拒绝时，在 READ COMMITTED 快照下各自的事务都看不到对方未提交的 REJECTED 写入，双方 remaining 均为 1，回退双双跳过并正常提交。",
+        "impact": "任务停留在 ASSIGNED 且 0 个 INVITED、0 个 ACCEPTED，PRD 规定「所有审稿人均拒绝邀请→系统自动回退待分配」（状态机表第 3 条，系统自动）在并发下静默失效；retry_count 不递增、S-02 分配困难追踪与通知延迟。仅当每日 process_scheduled 的 `_expire_invitations` ASSIGNED 扫描（process_scheduled.py:93-107，alive/accepted 均空则回退）次日兜底才能恢复，窗口最长约 24 小时。串行拒绝路径本身正确。",
+        "location": "dev/backend/apps/tasks/views.py:175",
+        "severity": "一般",
+        "title": "reject_invitation 的「全部拒绝回退」判定（remaining==0 and accepted==0）基于无锁读，最后两位审稿人并发拒绝时双双漏判，自动回退静默丢失"
+      },
+      {
+        "evidence": "`marked = task.assignments.filter(assignment_status__in=['INVITED', 'ACCEPTED', 'REVIEWING']).update(assignment_status='EXPIRED')` 在 autocommit 下先行提交，随后的 `StateMachineService.execute_transition(task, 'SUBMITTED', ...)` 开启的是另一个独立事务（其自带 @transaction.atomic），整个 action 无外层 atomic 包裹。",
+        "impact": "execute_transition 抛 StateMachineError（如并发下任务已被最后一个提交者自动转为 SUBMITTED、或被 handle_overdue 并发回退）或进程在两步之间中断时，EXPIRED 标记不可回滚：任务仍滞留原状态，但被标记的审稿人已被清出本轮（submit 门只认 ACCEPTED/REVIEWING），且因 (task, reviewer) unique_together 无法重新邀请（轮1 #434）。这是 P0 修复（AC-T-11 三要素 + EXPIRED 标记）新引入代码的原子性缺口。",
+        "location": "dev/backend/apps/tasks/views.py:211",
+        "severity": "一般",
+        "title": "P0 修复引入：force_summarize 的 EXPIRED 批量标记与状态转换非原子，转换失败时已标记的分配不回滚"
+      },
+      {
+        "evidence": "check_download_permission：`if ReviewAssignment.objects.filter(reviewer=user, task__in=related_tasks).exists(): return` —— 无 assignment_status 条件，INVITED/REJECTED/EXPIRED 均放行。任务可见性同样：`qs = qs.filter(assignments__reviewer=user).distinct()`（tasks/views.py:32）不区分分配状态，拒绝/过期审稿人永久保留任务详情、状态日志访问权。",
+        "impact": "收到邀请尚未接受的审稿人即可下载未发表稿件全文；拒绝邀请或邀请过期后访问权不收回，可无限期继续下载稿件与查看任务进度。对未发表学术稿件的保密性构成持续暴露（暴露面限于曾被编辑部邀请的用户）。P0 严重#4 修复（四类主体放行）未按分配生命周期收敛。",
+        "location": "dev/backend/apps/files/services.py:150",
+        "severity": "一般",
+        "title": "「被分配审稿人」判定不区分 assignment_status：INVITED 未接受即可下载稿件，REJECTED/EXPIRED 拒绝或过期后仍可永久下载稿件并保留任务可见性"
+      },
+      {
+        "evidence": "ReviewTask.save：`count = ReviewTask.objects.filter(task_id__startswith=f'RT-{today}').count(); self.task_id = f'RT-{today}-{count + 1:04d}'`；ReviewAssignment.save（models.py:112-120）、ReviewForm.save（forms/models.py:18-24）、Template.save（tasks/models.py:176-184）完全同构。对比 ReviewOpinion.save（forms/models.py:61-83）已在决策 #011 中改为 savepoint + 6 次冲突重试，其余四个模型未获同样处理。",
+        "impact": "两位编辑并发建任务（或并发分配/建模板）时读到相同计数、生成相同主键，后提交者 IntegrityError 直接 500（事务回滚，无数据损坏但操作失败需重试）；当日末号记录被删除后新建任务会复用已消失的编号，破坏 task_id 的审计恒定性（StateLog、通知、知识库 source_task_id 均以该编号溯源）。AC-T-14 类并发缺陷只修了意见编号一处。",
+        "location": "dev/backend/apps/tasks/models.py:51",
+        "severity": "一般",
+        "title": "ReviewTask/ReviewAssignment/ReviewForm/Template 四模型沿用「当日计数」主键生成且无锁无重试，并发创建撞主键 500、当日删尾后编号复用（AC-T-14 同类缺陷只修了 ReviewOpinion）"
+      },
+      {
+        "evidence": "`if overdue_only: qs = qs.filter(deadline__lt=timezone.now().date(), status__in=['PENDING', 'ASSIGNED', 'REVIEWING'])` —— ReviewTask.deadline 是创建时录入的「期望完成日期」；assign_reviewers 只写 assignment.deadline（views.py:97-104），从不更新 task.deadline，回退重分配后亦然；审稿人级超时（cron 标 OVERDUE 的口径）基于 assignment.deadline。",
+        "impact": "审稿人已全部超时的任务，只要任务级期望完成日期未到，就不会出现在编辑部看板的超时筛选中（例如期望完成日期设为 30 天后、审稿人截止 14 天，则超时后 15 天内看板 overdue=false），编辑依看板判断的超时现状与 assignment 级 OVERDUE 实况脱节，延误 PRD US-E-04 要求的「快速发现超时并重新分配」。",
+        "location": "dev/backend/apps/tasks/views.py:317",
+        "severity": "一般",
+        "title": "dashboard 的 overdue 筛选基于任务创建时的期望完成日期（task.deadline），与分配/重新分配设定的审稿人实际截止日期脱节，超时筛选失真"
+      },
+      {
+        "evidence": "`except ValueError: pass  # 已存在归档记录（幂等）` 与 `except Exception as e: logger.warning('知识库归档失败(不阻断决策): ...')` —— ValueError 分支无任何日志；knowledge/views.py 仅暴露 search/detail/pending_reviews/review_anonymization/export 五个动作，无重新归档入口。对比 PRD 边界场景表：「归档失败｜1. 记录失败日志；2. 系统通知编辑部；3. 编辑部可手动触发重新归档」。",
+        "impact": "知识库第一阶段归档失败（除「已存在」外的任何 ValueError 及其他异常）后任务已 DECIDED 不会再触发归档，编辑部既收不到通知也无接口补归档，该任务的知识库闭环静默丢失，只能人工发现。不阻断决策主流程的取舍本身合理，但 PRD 要求的通知与补救路径缺失（P0 修复「DECIDED 自动归档」的善后缺口）。",
+        "location": "dev/backend/apps/tasks/views.py:286",
+        "severity": "一般",
+        "title": "P0 修复引入：DECIDED 自动归档失败时静默吞掉——ValueError 无日志、其他异常仅 warning、不通知编辑部且全后端无手动重新归档入口"
+      },
+      {
+        "evidence": "`operator_type='EDITOR' if operator_user else 'SYSTEM'`。accept_invitation 以 `StateMachineService.execute_transition(task, 'REVIEWING', user, '首位审稿人接受邀请')`（views.py:144-146）、reject_invitation 以 `handle_all_rejected(task, user)`（views.py:179）传入审稿人作为 operator_user，两条 StateLog 的 operator_type 均落 'EDITOR'。PRD 状态流转表将「已分配→审稿中（首位审稿人接受邀请）」与「已分配→待分配（所有审稿人均拒绝邀请）」的操作者均定义为「系统（自动）」。",
+        "impact": "审计口径失真：由审稿人动作引发的系统自动转换在 state_logs 中被记为编辑部操作，且作者视角下出现 operator_type='EDITOR' 而 operator_name='审稿人'（P1 脱敏替换）的自相矛盾记录，削弱 AC-T-04「操作人可追溯」的准确性；不影响身份泄露（脱敏已覆盖）。",
+        "location": "dev/backend/apps/tasks/state_machine.py:106",
+        "severity": "建议",
+        "title": "StateLog.operator_type 仅凭 operator_user 是否为空判定，审稿人触发的「首位接受→REVIEWING」「全拒绝→PENDING」被记为 EDITOR，与 PRD「系统（自动）」口径不符"
+      },
+      {
+        "evidence": "`if task.retry_count > 3: NotificationService.notify_editor_in_chief(task=task, message=f'任务 {task.task_id} 分配困难，已有 {task.retry_count} 次重试')` —— 第 4、5、6…次回退每次都会向全部编辑部用户各发一条；对比 process_scheduled._notify_editor_in_chief（process_scheduled.py:193-198）有 48 小时 title 去重。ReviewTask 模型也无任何「分配困难」显式标记字段，仅靠 retry_count>3 隐式表达。",
+        "impact": "反复回退的任务会周期性向全部编辑部用户重复推送相同主旨的通知，形成通知噪音；「标记该稿件为分配困难」（PRD S-02）在数据层无承载，下游（看板、筛选）无法直接按该状态取数。不影响重试上限的正确性（PRD 未要求硬停止）。",
+        "location": "dev/backend/apps/tasks/state_machine.py:196",
+        "severity": "建议",
+        "title": "increment_retry_count 超过 3 次后每次递增都向全体编辑部重复发送「分配困难」通知（无去重、无上限），且无显式「分配困难」标记字段"
+      },
+      {
+        "evidence": "view 只接受 `action_type = request.data.get('action', '')  # 'summarize' or 'rollback'`；process_scheduled 通知标题为「请选择处理方式」，正文仅列「1. action=summarize —— 基于已提交意见强制汇总 2. action=rollback —— 回退待分配…随后可重新分配」，而命令头注释自述「编辑三选一处理（强制汇总/回退待分配/重新分配）」，PRD 477 行明确第三选项为「重新分配新审稿人（截止日期从重新分配时起算至少7天）」。",
+        "impact": "编辑按通知只能执行二选一，「重新分配」需自行理解为 rollback 后再调 assign_reviewers 的组合操作；文案与能力不符（自称三选一实列两项），且 S-02 的「重新分配截止日期≥7天」规则在提示与校验中均无承载，编辑无从知晓该约束。",
+        "location": "dev/backend/apps/tasks/views.py:232",
+        "severity": "建议",
+        "title": "超时处理「三选一」缺第三选项：handle_overdue 仅支持 summarize/rollback，PRD 的「重新分配新审稿人（截止日期≥7天）」既非独立动作也未在通知文案中说明达成路径"
+      },
+      {
+        "evidence": "`if assignment.assignment_status == 'SUBMITTED': return Response({'error': '已提交审稿意见，不可再保存草稿'}, status=400)` —— 唯一的状态门。REJECTED/EXPIRED/OVERDUE/INVITED 状态的分配乃至任务已 DECIDED 后均可继续新建/更新草稿（FormService、模型层亦无约束）。",
+        "impact": "已拒绝邀请或邀请已过期的审稿人仍可对任务写草稿（编辑部意见列表可见这些无意义草稿，形成噪音），任务终态后草稿仍可变更，与「接受邀请后进入审稿撰写」的业务语义不符；无权限或数据泄露后果（草稿仅本人与编辑部可见）。",
+        "location": "dev/backend/apps/forms/views.py:509",
+        "severity": "建议",
+        "title": "save_draft 状态门仅排除 SUBMITTED：REJECTED/EXPIRED/OVERDUE/INVITED 分配乃至任务 DECIDED 后仍可创建和更新审稿草稿"
+      }
+    ],
+    "checked_ok": [
+      "状态机转换表与 PRD §2.3.3 逐条比对一致：9 个唯一转换对（含 C-01 新增的三条 REVIEWING 异常出口）全部定义，DECIDED→REVIEWING 按口径仅作 P1 预留注释未开放",
+      "execute_transition 在事务内先 select_for_update 行锁重取任务行、再校验、再写状态并自增 version，StateLog 完整记录 from/to/操作者/触发原因（AC-T-04 可追溯）",
+      "P0 修复「make_decision 先落库再转状态」复核成立：update_fields 先 save 再 execute_transition 重取行转换，决策字段入库路径正确",
+      "P0 修复「force_summarize AC-T-11 三要素」在本端点内复核成立：原因必填、≥1 份 SUBMITTED 意见校验、未提交者批量置 EXPIRED、reason 以「强制」前缀匹配状态机放行约定（原子性与 handle_overdue 旁路另报）",
+      "check_and_transition_on_submit 的参与人集合含 ACCEPTED/REVIEWING/SUBMITTED，轮1 前的空集死逻辑已修复，最后一人提交自动转 SUBMITTED 的 AC-T-14 路径正确",
+      "分歧标注阈值与 PRD 一致：max-min≥3 严重(红)、=2 明显(黄)、≤1 不入分歧列表，且每个分歧点携带 scoreDistribution/distributionText 分布信息（S-05）",
+      "一致点分析按 S-05 区分正向一致（diff≤1 且均分≥4）与负向一致（diff≤1 且均分≤2）",
+      "generate_report 幂等性成立：SUBMITTED 状态门在最前，已存在报告走更新分支，任务转 SUMMARIZED 后重复调用在状态门处 400 终止，不会产生重复报告",
+      "summaries 全部五个端点（list/retrieve/detail/generate/match_rule_preview）均有 is_editor 门禁，含审稿人真实身份的 dimension_comparison/overall_comments 不会经汇总接口外泄给作者或审稿人",
+      "P1 修复「SummaryReportBriefSerializer 补 task_title」复核成立：简要与完整序列化器均输出 task_id/task_title（完整版另含 task_status）",
+      "P1 修复「state_logs 审稿人操作者脱敏」复核成立：非编辑部视角下对 reviewer_ids 内操作者的 operator_name 替换为「审稿人」，StateLogSerializer 不暴露 operator_user 外键，trigger_reason 文案不含身份信息",
+      "规则引擎优先级链（Rule-7>Rule-4>Rule-6>Rule-5>Rule-3>Rule-2>Rule-1）与「多数=ceil(total/2)」定义和 PRD C-06 一致，1-2 位审稿人 advisoryOnly 标注存在（Rule-4/Rule-5 条件偏差与 2 人场景结论系轮1 #49/#50/#419 遗留，未重复报告）",
+      "审稿意见串行重复提交被正确拒绝：同 assignment+round+SUBMITTED 查重返回 400，ReviewOpinion.assignment 的 OneToOne 约束提供数据库级兜底",
+      "审稿表单获取时机正确：get_form 要求审稿人 assignment 处于 ACCEPTED/REVIEWING/SUBMITTED 才返回表单，未接受邀请拿不到表单；ai_review 同样限定 ACCEPTED/REVIEWING",
+      "task_opinions 作者分支归属校验（轮1 严重#3 修复）复核成立：非本人稿件 403，且 SUMMARIZED/DECIDED 状态门与 publish_opinions_to_author 双门在前",
+      "模板快照冻结正确：create_form_for_task 深拷贝模板维度并存入表单，模板后续变更不影响已生成表单（懒创建兜底幂等）",
+      "accept/reject 邀请均以 assignment_status=='INVITED' 为唯一响应门，与分配状态枚举一致；邀请有效期统一 date+3 天，与 PRD 3 天口径一致",
+      "opinions/submit 与 summaries/generate 的通知发送在事务外/异常捕获内执行，通知失败不会回滚业务主流程",
+      "dashboard 的 status/subject 筛选为等值过滤无注入面；overdue 比较两侧均为 date（DateField 对 timezone.now().date()），无 date/datetime 混用错误；默认排序字段 -created_at 合法（sort 无白名单问题已在轮1 #385 记录）",
+      "assign_reviewers 空审稿人列表返回 400、非编辑部 403、状态门限 PENDING/ASSIGNED，重复分配由 unique_together 兜底静默跳过（其无法重邀旧审稿人的副作用已在轮1 #434 记录）",
+      "increment_retry_count 行锁自增正确、无死循环风险：仅在全部拒绝/超时回退等事件点被调用，非循环调用（通知重复与无上限问题另报建议）",
+      "make_decision 以 publish 门控终审决策通知（if publish: send_decide）与 PRD 决策流程图「系统通知作者（如选择发布）」一致"
+    ]
+  },
+  {
+    "dimension": "data-integrity",
+    "findings": [
+      {
+        "evidence": "views.py make_decision：`with transaction.atomic():`（L264）内 `try: ... AnonymizationService.auto_anonymize(task, report) except ValueError: pass  # 已存在归档记录（幂等） except Exception as e: # 归档失败不阻断决策主流程 logger.warning(...)`。auto_anonymize 内部执行 `KnowledgeItem.objects.create(...)`（knowledge/services.py:99），该调用未被任何内层 transaction.atomic()/保存点包裹。其主键 KI-YYYYMMDD-NNNN 为当日计数生成（models.py:50-56，无重试），同日两个任务并发决策即可碰撞触发 IntegrityError/DataError。",
+        "impact": "该 except 分支是决策 #012 新增代码，但其目标仅在「非数据库异常」场景成立：一旦归档发生数据库层错误（典型如同日并发决策的 KI 主键碰撞），PostgreSQL 当前事务即刻进入 aborted 状态，Python 层捕获无法治愈——外层 atomic 块退出时要么抛 TransactionManagementError（客户端 500，决策/DECIDED 转换/通知全部回滚），要么提交被服务端降级为 ROLLBACK（客户端收到 200「终审决策已录入」且响应携带内存对象的 DECIDED 假象，而库中任务仍是 SUMMARIZED、决策字段为空——静默数据丢失）。待核实点：两种表现具体取哪种取决于 psycopg3 对中止事务 commit 的处理，需实验确认；但无论哪种，「归档失败不阻断决策主流程」的修复承诺在 DB 错误场景均不成立。",
+        "location": "dev/backend/apps/tasks/views.py:280-293（配合 dev/backend/apps/knowledge/services.py:99-116）",
+        "severity": "严重",
+        "title": "P0修复的「归档失败不阻断决策主流程」用裸 except Exception 实现，无保存点隔离：归档发生数据库错误时整个决策事务已被中止，终审决策随归档故障整体回滚且客户端被误导"
+      },
+      {
+        "evidence": "服务层签名 `def review_anonymization(cls, knowledge_id, reviewer, decision, notes=''):` 之后的方法体（L389-416）只操作 item.anonymization_status/reviewed_by/reviewed_at/archived_at 并 save，notes 参数从未被引用；KnowledgeItem 模型也没有任何备注字段。而 P1 批（决策 #013）将前端对齐为提交 notes：KnowledgeReview.vue L146-147 `decision, notes: reviewNote.value,`，后端 AnonymizationReviewSerializer 也定义并校验了 notes 字段（serializers.py:91-96）。",
+        "impact": "编辑在审核界面填写的审核备注（如退回原因、脱敏修改要求）经 200 成功响应静默丢弃，库中无任何留存，响应序列化器也无该字段可供用户察觉；审核过程不可追溯，违背两阶段审核留痕要求。这是修复批之间的契约断裂：P1 前端对齐了载荷，后端只接不用。",
+        "location": "dev/backend/apps/knowledge/services.py:378-419（配合 serializers.py:91-96、frontend/src/views/knowledge/KnowledgeReview.vue:146-147）",
+        "severity": "严重",
+        "title": "知识库人工审核的 notes 审核备注被后端接收后直接丢弃：P1 前端已改为提交 {decision, notes}，序列化器校验通过，但服务层与模型均无持久化，编辑输入静默丢失"
+      },
+      {
+        "evidence": "`assignment.save()` 后在各自未提交事务内统计：`remaining = task.assignments.filter(assignment_status='INVITED').count()`、`accepted = task.assignments.filter(assignment_status='ACCEPTED').count()`、`if remaining == 0 and accepted == 0: StateMachineService.handle_all_rejected(task, user)`。READ COMMITTED 下 A 事务在提交前看不到 B 刚写入的 REJECTED，双方统计时对方行仍是 INVITED，remaining 均为 1。",
+        "impact": "PRD/状态机定义的 ASSIGNED→PENDING（全部审稿人均拒绝邀请）自动路径在并发下静默失效：任务滞留 ASSIGNED、retry_count 不递增、分配困难通知不触发。编辑部仅从两条拒绝通知中人工察觉后可经 assign_reviewers（ASSIGNED 状态允许）补救，但系统层面的自动回退承诺失效且无任何告警。",
+        "location": "dev/backend/apps/tasks/views.py:174-181",
+        "severity": "严重",
+        "title": "两位审稿人并发拒绝邀请时「全部拒绝→自动回退PENDING」竞态失效：各自的 remaining 计数看不到对方未提交的 REJECTED，双双跳过回退，任务滞留 ASSIGNED"
+      },
+      {
+        "evidence": "`marked = task.assignments.filter(assignment_status__in=['INVITED', 'ACCEPTED', 'REVIEWING'],).update(assignment_status='EXPIRED')` 之后直接调用 `StateMachineService.execute_transition(task, 'SUBMITTED', ...)`——update 在自动提交模式下立即生效，execute_transition 自带的事务只覆盖状态转换本身；视图对 StateMachineError 也无捕获（对比同文件 create/assign/accept/reject/make_decision 均有 atomic 包裹）。",
+        "impact": "当最后一位审稿人并发提交使任务先一步变为 SUBMITTED 时（或转换校验因任何原因失败），编辑收到 500/400，但 EXPIRED 标记已不可逆落库：在途提交事务的 assignment.save() 全量覆盖会把其中一条改回 SUBMITTED，形成任务 SUBMITTED + 部分分配 EXPIRED/部分 SUBMITTED 的混合状态。编辑重试可恢复（状态仍 REVIEWING 时），但首次失败留下的部分落库违背原子性且无补偿逻辑。",
+        "location": "dev/backend/apps/tasks/views.py:210-218",
+        "severity": "一般",
+        "title": "force_summarize 的批量置 EXPIRED（.update()）与 execute_transition 不在同一事务：转换失败时 EXPIRED 标记已提交且不可回滚"
+      },
+      {
+        "evidence": "以 ReviewTask 为例：`count = ReviewTask.objects.filter(task_id__startswith=f'RT-{today}').count(); self.task_id = f'RT-{today}-{count + 1:04d}'`——同日并发创建时各事务互相看不到未提交行，计数相同、主键相同。同类代码遍布 ReviewAssignment(L112-120)、ReviewForm(forms/models.py:18-24)、Template(TPL)、SummaryReport(SR)、KnowledgeItem(KI)、User(U-，users/models.py:30-38)，均无 try/except；仅 ReviewOpinion.save 有保存点重试。配套的 check-then-act：assign_reviewers 的 `if ReviewAssignment.objects.filter(task=task, reviewer=reviewer).exists(): continue`（views.py:94）与 FormService.create_form_for_task 的 `existing = ReviewForm.objects.filter(task=task).first()`（forms/services.py:36）同属事务外/无锁预检。",
+        "impact": "所有实体的唯一性最终由主键或 unique 约束兜底，不会产生重复或脏数据（fail-safe），但并发窗口内的失败一律表现为未捕获 IntegrityError → 500：两位编辑同时建档、同日两任务同时决策归档（即触发严重#1的入口）、双击生成表单等场景均 500，客户端无友好错误且无重试引导。",
+        "location": "dev/backend/apps/tasks/models.py:51-59（同型：tasks/models.py:112-120、forms/models.py:18-24、summaries/models.py:22-28、knowledge/models.py:50-56、users/models.py:30-38；tasks/views.py:94；forms/services.py:35-42）",
+        "severity": "一般",
+        "title": "除 ReviewOpinion 外全部业务主键为「当日计数」生成且无重试：并发创建必然主键冲突返回 500（任务/分配/表单/模板/汇总报告/知识库/用户全族），叠加 assign_reviewers 的 exists() TOCTOU 与表单懒创建 get-or-create 竞态同样 500"
+      },
+      {
+        "evidence": "视图在无锁状态下检查 `if task.status != 'SUBMITTED'` 后调用 generate_report；服务层（整体 @transaction.atomic）内 `report = SummaryReport.objects.get(task=task)` 抛 DoesNotExist 后 `report = SummaryReport(task=task); report.save()`，插入发生在 execute_transition 取行锁之前。两个并发请求都通过前置检查时，后到事务的 INSERT 阻塞在 OneToOne(task) 唯一索引上直至先行事务提交，随后抛 IntegrityError——generate 视图仅捕获 StateMachineError 与 ValueError。",
+        "impact": "双击/并发触发的第二个请求返回 500 而非幂等的 400/409。数据层因 OneToOne 约束不会产生重复报告（顺序重复调用已被 status!=SUBMITTED 挡住返回 400，该路径防护成立），属可恢复的边缘并发缺陷。",
+        "location": "dev/backend/apps/summaries/views.py:106-117（配合 summaries/services.py:499-525）",
+        "severity": "一般",
+        "title": "summaries/generate 并发双触发：后到事务在汇总报告 OneToOne 插入处抛未捕获 IntegrityError 返回 500"
+      },
+      {
+        "evidence": "`item = KnowledgeItem.objects.get(knowledge_id=knowledge_id)` 校验 `item.anonymization_status not in allowed` 后，直接对同一实例逐字段赋值并 `item.save()`（全量保存）。两个编辑并发操作同一 PENDING_REVIEW 条目时：A 写入 APPROVED+archived_at，B（以旧实例）写 PERMANENTLY_EXCLUDED 后保存，B 的全量 save 会把 A 已写入的 archived_at 一并覆盖回 None。",
+        "impact": "「APPROVED 不可逆归档」的语义在并发下可被反向翻转：先审核通过的条目可被并发操作改回 PERMANENTLY_EXCLUDED 且丢失 archived_at 归档时间，或反之；审核结论以网络时序而非业务规则定胜负，审核留痕（reviewed_by/reviewed_at）同样可能被覆盖失真。",
+        "location": "dev/backend/apps/knowledge/services.py:389-416",
+        "severity": "一般",
+        "title": "review_anonymization 无行锁无事务：两位编辑并发审核同一条目时旧实例全量 save 后写覆盖前写，「不可逆归档」可被并发撤销且 archived_at 丢失"
+      },
+      {
+        "evidence": "`StateLog.objects.create(..., operator_type='EDITOR' if operator_user else 'SYSTEM', operator_user=operator_user, ...)`。accept_invitation（tasks/views.py:143-146）以审稿人身份调用 `execute_transition(task, 'REVIEWING', user, '首位审稿人接受邀请')`，reject_invitation 的 handle_all_rejected 同理；而 `class OperatorType(models.TextChoices): SYSTEM/EDITOR` 无 REVIEWER 取值。",
+        "impact": "审计数据层把审稿人触发的 ASSIGNED→REVIEWING、ASSIGNED→PENDING 记录为「编辑部」操作。P1 修复的 state_logs 脱敏是在响应层按 operator_user_id 是否属于任务审稿人集合改写 operator_name，掩盖了展示但底层数据归属仍错：任何按 operator_type=EDITOR 过滤/统计的消费方（报表、导出、未来功能）会把审稿人动作计入编辑部行为，与 AC-T-04 可追溯口径不符。",
+        "location": "dev/backend/apps/tasks/state_machine.py:106（配合 tasks/models.py:129-131、tasks/views.py:143-146）",
+        "severity": "一般",
+        "title": "审稿人触发的状态转换在 StateLog 中 operator_type 恒记为 'EDITOR'：OperatorType 枚举无 REVIEWER，审稿人的接受/拒绝动作被审计数据归为编辑部操作"
+      },
+      {
+        "evidence": "L84：`pending_segments = cls._scan_segments(anonymized_summary)`——唯一扫描入口只针对 summary 文本；L149-151 的注释自述「保留 opinionId/score/comment（位置序即审稿人A/B口径）」，各维度评语原文随 anonymized_dimensions 落库；_build_anonymized_summary 的【维度评分对比】段「只渲染分值数字，不落原始 dict」（L194），维度评语不出现在 summary 文本中，四类正则（贵校/北京大学/NSFC编号等）对其零覆盖。",
+        "impact": "审稿人在维度评语中写「北京大学团队」「贵校」等身份线索时，不会生成 pending_review_segments 提示条目，人工审核阶段缺少系统标记引导，条目可在含身份线索的状态下被 APPROVED 进入对审稿人开放的检索库。人工审核员虽仍可肉眼看到 anonymized_dimensions，但四类自动检测的覆盖承诺（PRD §5.3.1）存在盲区。",
+        "location": "dev/backend/apps/knowledge/services.py:81-84（配合 145-152、241-270）",
+        "severity": "一般",
+        "title": "致命#8 修复后知识库四类身份检测只扫描 anonymized_summary 文本，不扫描 anonymized_dimensions 中保留的各维度评语原文，身份线索可绕过待审核标记进入已归档数据"
+      },
+      {
+        "evidence": "`opinion = ReviewOpinion.objects.filter(assignment=assignment, round=1, status='DRAFT').first()` 之后 `if opinion: ... else: ReviewOpinion.objects.create(...)`，整个过程无 transaction.atomic、无 get_or_create、无 IntegrityError 捕获；ReviewAssignment 与 ReviewOpinion 为 OneToOne（assignment 字段），第二个 INSERT 必然违反唯一约束。",
+        "impact": "60 秒自动保存与手动保存并发、或双击保存时，后到请求 500（IntegrityError 经 ReviewOpinion.save 的 6 次错位重试后仍抛出），该次草稿内容丢弃；先到请求成功，数据不脏（OneToOne 兜底）。属边缘场景缺陷。（轮1 #437 已覆盖 submit 侧同机制，本条为 save_draft 独立代码路径，且其根因是无事务的 get-or-create 而非重试误判。）",
+        "location": "dev/backend/apps/forms/views.py:526-551",
+        "severity": "一般",
+        "title": "save_draft 无事务包裹的 read-then-create：自动保存与手动保存并发时双双判定「无草稿」并各自 create，OneToOne 冲突使后到请求 500、该次草稿内容丢弃"
+      },
+      {
+        "evidence": "settings.py：`TIME_ZONE = 'Asia/Shanghai'; USE_TZ = True`。而 `invitation_expiry = timezone.now().date() + timedelta(days=3)`、`task_deadline = ...(timezone.now().date() + timedelta(days=14))`、dashboard `qs = qs.filter(deadline__lt=timezone.now().date(), ...)`、`review_year=now.year, review_month=now.month`——timezone.now() 为 UTC。",
+        "impact": "北京时间 00:00-08:00 期间创建的邀请有效期与默认截止比业务口径少一天、dashboard 的 overdue 边界与前端本地日期判断相差 8 小时；月末最后 16 小时做出的终审决策其知识库 review_year/review_month 归入上一月，按年月检索（KnowledgeService.search 的 date_start/date_end 过滤）与统计口径随之偏移。轮1 #413 已覆盖 process_scheduled 内同源问题（且该处 created_at__date 按本地时区解释与 UTC today 混用），本条为其未覆盖的其余写入点；应统一改用 timezone.localdate()/localtime()。",
+        "location": "dev/backend/apps/tasks/views.py:87-88、317-320（配合 knowledge/services.py:97-106、settings.py:115-117）",
+        "severity": "建议",
+        "title": "业务时区为 Asia/Shanghai 但全部日期写入用 UTC 日期（timezone.now().date()/.year/.month）而非 localdate()：00:00-08:00 期间邀请有效期/默认截止少一天、overdue 判定边界偏移 8 小时、月末 16 小时内决策的知识库归档月份错误"
+      },
+      {
+        "evidence": "`formatDate = (date, format = 'YYYY-MM-DD HH:mm') => { if (!date) return '-'; return new Date(date).toLocaleString('zh-CN', {...}).replace(/\\//g, '-') }`。后端 DateField 序列化为 'YYYY-MM-DD'，new Date('YYYY-MM-DD') 按 ECMAScript 规范解析为 UTC 午夜，在 UTC+8 环境显示为当日 08:00；另 format 参数从未被使用。",
+        "impact": "TaskDetail.vue:19、ReviewForm.vue:9 等处的截止日期显示为「2026-10-25 08:00」这类凭空出现的时刻，且 00:00-08:00 期间跨日显示可能与实际日期差一天；纯日期字段应使用 formatDateOnly。属展示缺陷。",
+        "location": "dev/frontend/src/utils/status.js:44-50（TaskDetail.vue:19、ReviewForm.vue:9 调用）",
+        "severity": "建议",
+        "title": "前端 formatDate 把 DateField 的纯日期串按 UTC 午夜解析后以本地时间展示，截止日期渲染出多余的「08:00」时刻"
+      }
+    ],
+    "checked_ok": [
+      "make_decision「先落库再转状态」修复（轮1致命#6）复核成立：update_fields 覆盖 final_decision/decision_notes/publish_opinions_to_author 全部三个字段，execute_transition 在同事务内 select_for_update 重取行可见已保存字段并全量 save，决策字段不再丢失；后续全量 save 同时刷新 updated_at，update_fields 未含该字段无实际影响",
+      "并发最后两人同时 submit 的自动转 SUBMITTED（C-04）复核成立：check_and_transition_on_submit 的 select_for_update 使后到事务等待对方整个事务提交后再重读，能看见全部 SUBMITTED 才转换；participants 集合含 SUBMITTED 状态的修复避免了最后一人提交时空集提前返回",
+      "ReviewOpinion.save 的保存点+重试实现复核成立：内层 transaction.atomic() 在嵌套时形成保存点，主键冲突回滚限于保存点内不污染外层 submit 事务；READ COMMITTED 下重试重新计数可见已提交的冲突行，新编号递增",
+      "assignments 的 (task, reviewer) unique_together 数据库层约束存在（tasks/migrations/0002 AlterUniqueTogether），并发重复分配由 DB 约束兜底，不产生重复分配脏数据（接口层面表现为 500，见发现5）",
+      "迁移链与模型无漂移：逐字段比对 tasks(0001/0002)、forms(0001-0003)、summaries、knowledge、notifications(含0004 TASK_CREATED 枚举增补)、users(0001/0002 UserAIConfig) 与各自 models.py 一致，含 on_delete 策略、索引、email unique=True、ReviewOpinion/SummaryReport 的 OneToOne 约束",
+      "JSONField 默认值全部为可调用 default=list/default=dict（tasks/forms/summaries/knowledge/users 全部模型），无 default=[] 字面量共享可变引用陷阱；init_default_templates 的字面列表仅 create 传参",
+      "auto_anonymize 的 ValueError 捕获范围精确：该异常仅在去重分支（services.py:76-78 已存在归档记录）抛出，与 make_decision 的「幂等」注释语义一致；顺序重复决策被 status==SUMMARIZED 前置校验+状态机行锁校验双重拦截，不会重复归档",
+      "StateLog 创建不会因 operator_user 为 None 失败（null=True 且 operator_type 走 SYSTEM 分支）；P1 state_logs 审稿人操作者脱敏复核成立：非编辑部视角下 operator_user_id 命中 reviewer 集合时 operator_name 改写为「审稿人」，zip(serializer.data, logs) 顺序对齐，reviewer_id 与 operator_user_id 同为 user_id 值域比对正确",
+      "ReviewTaskSerializer.to_representation 双盲裁剪（P0 致命#5）复核成立：作者视角剥离 assignments 的 reviewer/reviewer_name/reviewer_email/reviewer_research_areas，双盲下审稿人视角剥离 author_name/author_email，make_decision/my_articles/dashboard 均经 request 上下文生效，无请求上下文时按编辑部口径全量返回",
+      "change_password（P0 致命#4）复核成立：validate_old_password 校验旧密码，set_password 哈希落库，update_fields=['password','updated_at'] 显式包含 auto_now 字段",
+      "锁顺序一致性：submit（意见插入→assignment 更新→task 行锁）、accept/reject（assignment→task）、force_summarize（assignment 批量→task）均为先 assignment 后 task，未发现交叉加锁死锁环路",
+      "通知与业务写库同事务（submit 除外，其通知显式事务外发送且失败仅记日志），事务回滚时通知一并回滚，不产生幻影通知",
+      "task_opinions 作者归属校验（轮1严重#3 修复）复核成立：task.author_user_id != user 返回 403，状态与 publish 双门槛保留",
+      "知识库 _strip_identity_keys 递归脱敏以 comprehension 构建新容器，不修改 SummaryReport 存量 JSON 对象，无反向污染副作用"
+    ]
+  },
+  {
+    "dimension": "config-deploy",
+    "findings": [
+      {
+        "evidence": "settings.py:34 `DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'`；.env.example:7 模板默认 `DJANGO_DEBUG=True`；dev/backend 目录下实际不存在 .env 文件（ls 确认），兜底值即生效；dev/README.md:64 唯一启动方式为 `python manage.py runserver`，requirements.txt（全文 8 行）无 gunicorn/uvicorn/whitenoise 等任何生产服务器依赖，全仓库无 collectstatic/nginx/HTTPS 部署文档。",
+        "impact": "环境变量遗漏或照模板复制 .env 即以 DEBUG=True 上线：详细错误页向外泄露堆栈与配置；且当前实例（pgdata 2026-10-19 仍在活动写入）实际就运行在 DEBUG=True 态。按现有文档走\"npm run build 生产构建\"的同时后端没有任何一处强制关闭调试的机制，前后端的\"生产\"口径不一致。",
+        "location": "dev/backend/review_platform/settings.py:34",
+        "severity": "一般",
+        "title": "DEBUG 兜底为 True、模板默认亦为 True，且全仓库无生产部署路径，当前实际运行态即 DEBUG=True"
+      },
+      {
+        "evidence": "views.py:95-102：`user = authenticate(request, username=email, password=password)` 失败后走 `user_obj = User.objects.get(email=email); if user_obj.check_password(password): user = user_obj`。Django ModelBackend 的 user_can_authenticate 会因 is_active=False 拒绝，而该兜底分支只做 check_password，不做任何 is_active 判断。",
+        "impact": "管理员经 Django admin 停用某账号后，该账号凭原密码仍可登录并换取 12 小时 access token；叠加无黑名单现状，停用处置在令牌有效期内完全失效。当前 API 无设置 is_active 的入口，故属边缘场景。",
+        "location": "dev/backend/apps/users/views.py:98",
+        "severity": "一般",
+        "title": "登录的 check_password 兜底分支绕过 is_active 校验，被停用账号仍可签发 12 小时 JWT"
+      },
+      {
+        "evidence": "脚本创建任务（L57-65）、分配审稿人、三人提交意见、生成汇总、make_decision（L117-121）后无任何 DELETE/回滚；make_decision 会触发 AnonymizationService.auto_anonymize（tasks/views.py:279-287）生成知识库归档与 pending 待审段；L62 `'manuscript_file': 'smoke_test.pdf'` 指向从未经 /files/upload/ 上传的文件；L37 硬编码口令 Demo@2026（演示口令，非生产凭据）。",
+        "impact": "每次运行在库里永久沉淀 1 条 DECIDED 任务及其 assignments、opinions、汇总报告、通知、状态日志和知识库待审段：编辑部知识审核工作台（pending_reviews 队列）混入假数据、任务计数与业务 ID 被刷高，演示/验收数据失真；且任务 manuscript_file 指向磁盘上不存在的文件。",
+        "location": "dev/backend/scripts/e2e_smoke.py:57",
+        "severity": "一般",
+        "title": "冒烟脚本零清理：每跑一次永久沉淀一条全链路 DECIDED 任务（含知识库待审段），且 manuscript_file 指向不存在的文件"
+      },
+      {
+        "evidence": "handle() 不校验 settings.DEBUG 或任何环境标识，直接按 DEMO_ACCOUNTS 建 5 个账号；L38 `password = os.environ.get('BOOTSTRAP_PASSWORD', 'Demo@2026')`，默认口令在 .env.example:25 与 README.md:73 公开可查；L74 输出 `f'引导完成：新建 {len(created)} 个演示账号，密码均为 {password}（请尽快修改）。'`。",
+        "impact": "命令被部署流程或运维误跑在非演示环境时，会创建口令公开可知的 editor@review.local（EDITOR 全权限：建任务、终审决策、用户管理）；口令回显还会随部署/操作日志扩散。轮1已备案\"演示账号场景\"，但\"无生产保护\"这一面未被覆盖。",
+        "location": "dev/backend/apps/users/management/commands/bootstrap_dev.py:37",
+        "severity": "一般",
+        "title": "bootstrap_dev 无任何生产环境保护，误执行即以公开文档口令创建含 EDITOR 的演示账号，且口令回显进管理日志"
+      },
+      {
+        "evidence": "`PyPDF2==3.0.1`（PyPDF2 项目已归档并并入 pypdf，2023 年起停止维护，无安全补丁）；其余依赖均为范围约束：`Django>=5.2.4,<5.3`、`djangorestframework>=3.16`、`djangorestframework-simplejwt>=5.5`、`django-cors-headers>=4.7`、`psycopg[binary]>=3.2,<4`、`PyMuPDF>=1.26`，无 lockfile。",
+        "impact": "任意登录用户上传的 PDF 由一个无人维护的解析器读取元数据（services.py:94-109、check_metadata 端点），其历史漏洞不会有上游修复；范围式依赖无锁定文件使构建不可复现，已装环境可能停留在 5.2.4——其后 Django 5.2.x 已发布多个安全修复版本，floor 约束无法保证已升级。",
+        "location": "dev/backend/requirements.txt:8",
+        "severity": "一般",
+        "title": "依赖固定在已停止维护的 PyPDF2 上解析不可信 PDF，且全线无版本锁定"
+      },
+      {
+        "evidence": "services.py:147-155：`related_tasks = ReviewTask.objects.filter(manuscript_file=uploaded_file.file_path)` 后按 `related_tasks.filter(author_user_id=user.user_id).exists()` 与 ReviewAssignment 放行\"任务作者/被分配审稿人\"；而 manuscript_file 是 ReviewTaskCreateSerializer 的自由 CharField（tasks/serializers.py:92-95，无 validate_manuscript_file），e2e_smoke.py:62 以 'smoke_test.pdf' 证明任意字符串可直接入库。",
+        "impact": "当前仅编辑部可创建任务（tasks/views.py:43-46）且编辑部本就全量可下载，故今日尚不可利用；但授权事实建立在\"任务作者=有权者\"的字符串等值上而非外键，一旦后续放开作者自建任务或放开该字段来源，伪造 manuscript_file 命中他人文件路径即可换取下载权。待核实：存储路径含微秒时间戳前缀，盲猜难度高，需配合其他泄露才可利用。",
+        "location": "dev/backend/apps/files/services.py:147",
+        "severity": "一般",
+        "title": "文件下载授权以未校验的路径字符串做任务关联，是 P0 对象级权限修复的潜在旁路面"
+      },
+      {
+        "evidence": "DATABASES（L91-100）无 CONN_OPTIONS/sslmode、无 CONN_MAX_AGE；全文件未设 SECURE_SSL_REDIRECT、SESSION_COOKIE_SECURE、CSRF_COOKIE_SECURE、SECURE_HSTS_SECONDS、SECURE_PROXY_SSL_HEADER；.env.example 亦未提供 sslmode 等对应键。",
+        "impact": "跨网部署时数据库凭据与稿件数据明文传输；反代 HTTPS 场景下管理后台会话 Cookie 仍可被 HTTP 下发，代理头信任未配置。轮1只报了 CORS/ALLOWED_HOSTS，未覆盖这一组。",
+        "location": "dev/backend/review_platform/settings.py:91",
+        "severity": "建议",
+        "title": "生产传输层安全配置整体缺失：无 HTTPS 强制、Secure Cookie、HSTS、代理头，数据库连接无 TLS"
+      },
+      {
+        "evidence": "views.py:139 `response['Content-Disposition'] = f'attachment; filename=\"{original_name}\"'`，上一行注释自称\"支持中文\"；original_name 为客户端可控字符串（services.py:46 直接取 file.name），可含引号、分号等。",
+        "impact": "本平台主场景即中文文件名：待核实具体表现——若按 Django 5.2 对非 ASCII 头的替换处理则文件名显示为问号（注释承诺落空），若编码路径不同则可能直接 500；文件名内特殊字符也可能破坏 filename 参数解析。",
+        "location": "dev/backend/apps/files/views.py:139",
+        "severity": "建议",
+        "title": "Content-Disposition 直接拼接客户端原始文件名，未做 RFC 5987 编码也未过滤特殊字符"
+      },
+      {
+        "evidence": "upload_pdf 先写盘（L79-85 `with open(full_disk_path, 'wb')`）后建库记录（L112-120），中间 DB 异常无磁盘回滚；全后端 grep throttle/ratelimit 零命中，上传仅受单文件 20MB 限制。",
+        "impact": "单一登录账号可无限次上传 20MB 文件灌满磁盘（且无水印/杀毒扫描）；失败与废弃上传的孤儿文件无任何引用也无清理，存储被逐步侵占。",
+        "location": "dev/backend/apps/files/services.py:79",
+        "severity": "建议",
+        "title": "上传无配额/频率限制，且先写盘后建库的失败场景会残留孤儿文件"
+      },
+      {
+        "evidence": "services.py:103-105 `logger.info(f'PDF元数据含作者信息: file={original_name}, author={pdf_author}')`；另 knowledge/services.py:418 `logger.info(f'审核完成: ki={knowledge_id}, decision={decision}, reviewer={reviewer.email}')`。settings.py 无任何 LOGGING 配置（用 Django 默认）。",
+        "impact": "双盲模式下 PDF 元数据作者名正是平台要匿名的信息，却以 INFO 级完整落入服务器日志（含 cron 重定向日志），运维可见即破坏双盲边界；审稿人邮箱同理属于可归集的个人信息。",
+        "location": "dev/backend/apps/files/services.py:103",
+        "severity": "建议",
+        "title": "双盲保护对象（PDF 元数据作者姓名）与审稿人邮箱被完整写入 INFO 日志"
+      },
+      {
+        "evidence": "models.py:74 `api_key = models.CharField('API密钥', max_length=500, blank=True)`，迁移 0002_useraiconfig 已应用；grep 全后端，该表当前无任何视图/序列化器读写（仅模型定义与迁移），effective_api_key 属性返回明文。",
+        "impact": "属于已落库的休眠凭据字段：未来接线\"用户自配 LLM Key\"功能时将按现有模型明文存储第三方 API 密钥，数据库层面无任何加密或脱敏设计。",
+        "location": "dev/backend/apps/users/models.py:74",
+        "severity": "建议",
+        "title": "UserAIConfig.api_key 明文 CharField 已随迁移落库，为未来功能预埋明文凭据存储"
+      },
+      {
+        "evidence": "README.md:38 `├── pgdata/ # PostgreSQL 15 数据目录（本地开发集群）`；README.md:53 以 `pg_ctl -D pgdata -l pgdata/server.log start` 启动；仓库各层目录大量 \"(1)\" 同步工具快照文件（IDEA(1).md、settings(1).py、package-lock(1).json 等）佐证整目录同步在发生。",
+        "impact": "集群数据目录（含全部用户口令散列与稿件数据）随代码目录被整体备份/同步分发；若活动实例的 postmaster.pid/WAL 被同步到另一台机器后再启动，会导致集群校验失败或数据回退损坏。待核实：pgdata 本身是否确在同步工具覆盖范围内（仅观察到同级/上层目录出现同步快照）。",
+        "location": "dev/README.md:38",
+        "severity": "建议",
+        "title": "PostgreSQL 集群数据目录内嵌项目目录，随目录级同步/备份整体外流"
+      }
+    ],
+    "checked_ok": [
+      "['.env.example 与 settings.py 的读取键一一对应：DJANGO_SECRET_KEY、DJANGO_DEBUG、DJANGO_DB_NAME/USER/PASSWORD/HOST/PORT、REVIEWER_LLM_API_KEY、REVIEWER_LLM_MODEL、BOOTSTRAP_PASSWORD 全部有代码读取方，CELERY_* 两键在模板中如实标注为未接线占位（决策 #011 已备案 Celery 降级）']",
+      "['REVIEWER_LLM_API_KEY 仅从环境变量注入、无代码内兜底值，且不出现在任何日志输出（apps/forms/ai_review.py:20-23），与 .env.example 声明一致']",
+      "['_load_dotenv 用 os.environ.setdefault 加载 .env，已存在环境变量优先、文件缺失时静默跳过，无覆盖注入风险（settings.py:12-29）']",
+      "['manage.py/wsgi.py/asgi.py 均为标准样板，仅 setdefault DJANGO_SETTINGS_MODULE，无硬编码值']",
+      "['登录无速率限制/账号锁定：现状与轮1一致（settings 无 DEFAULT_THROTTLE_CLASSES，全后端 grep throttle 零命中），未重复立项']",
+      "['JWT 无黑名单下 logout 仅前端删 token：确认现状——后端无 logout 端点，前端仅清 localStorage（stores/auth.js:50-56），INSTALLED_APPS 未含 token_blacklist']",
+      "['refresh 端点现状与轮1一致：urls.py 未挂载 TokenRefreshView，登录返回的 refresh token 后端无处兑换（未重复立项）']",
+      "['CORS_ALLOW_ALL_ORIGINS=True 但未设 CORS_ALLOW_CREDENTIALS（默认 False），认证走 Authorization 头而非 Cookie，不构成带凭证跨源（CORS 全开本身为轮1已报项）']",
+      "['媒体文件不经任何静态路由直接暴露：urls.py 未挂载 MEDIA 服务，runserver 亦不服务 media/，稿件只能经带对象级权限的下载端点中转（urls.py 全文核对）']",
+      "['文件上传大小有应用层硬校验（MAX_FILE_SIZE 20MB，services.py:59-65）叠加 DATA_UPLOAD_MAX_MEMORY_SIZE 20MB；扩展名白名单 .pdf 生效（Content-Type 仅告警不拦截为轮1已报项，未重复立项）']",
+      "['上传落盘文件名带微秒时间戳前缀（services.py:74-76），../ 穿越分量被前缀粘连无法构成独立分量，且 open(\\'wb\\') 不会自建目录，路径穿越实际不可达']",
+      "['P0 文件下载对象级权限修复成立：download/check_metadata/destroy 三路均收敛到 check_download_permission（编辑部/上传人/任务作者/被分配审稿人四类放行，services.py:132-156、287-292），list/retrieve 显式 405', '（另有独立发现：权限与任务的关联建立在未校验路径字符串上，见 findings）']",
+      "['bootstrap_dev 幂等性成立：按邮箱 get_or_create，已存在账号跳过且不重置已改密码（bootstrap_dev.py:43-59），模板与种子初始化自带存在性检查（knowledge/seed_data.py:75）']",
+      "['前端源码与构建配置无硬编码后端地址或密钥：axios baseURL 为相对路径 /api（src/api/index.js:6），vite.config.js 代理仅开发期指向 localhost:8000，vite build 默认关闭 source map']",
+      "['e2e_smoke.py 仅连接 127.0.0.1:8000 本地服务、不直接操作数据库，除演示口令 Demo@2026（与 bootstrap 默认一致、公开文档化，非生产凭据）外无其他敏感信息硬编码（其数据沉淀问题单列为 findings）']",
+      "['全局分页 PAGE_SIZE=20 配置在案；STATIC/MEDIA 路径常规定义；X-Frame-Options 由中间件默认 DENY']",
+      "['SECRET_KEY 与数据库口令的代码内兜底值、ALLOWED_HOSTS 含 *、ACCESS_TOKEN 12h、changeme123 默认密码、前端 token 存 localStorage 等其余轮1已报配置项，本轮逐一复核确认现状未变，均未重复立项']"
+    ]
+  },
+  {
+    "dimension": "frontend-tests",
+    "findings": [
+      {
+        "evidence": "api/index.js 401 分支：`ElMessage.error('登录已过期，请重新登录'); localStorage.removeItem('access_token'); ...; router.push('/login')` —— 只清 localStorage，不重置 Pinia store 的 token/user。router/index.js 守卫：`if (to.name === 'Login' && auth.isLoggedIn) { next({ name: 'Dashboard' }) }`，而 `isLoggedIn: (state) => !!state.token` 读的是仍持有旧 token 的 store。settings.py SIMPLE_JWT ACCESS_TOKEN_LIFETIME 12 小时且无刷新流程。",
+        "impact": "access token 12 小时过期后，任意请求触发 401 → toast「登录已过期，请重新登录」→ push('/login') 被守卫以 store 中仍为 true 的 isLoggedIn 弹回 Dashboard → 用户根本到不了登录页；Dashboard 的请求因 localStorage 已清而继续 401，循环弹错误 toast。只能靠右上角「退出登录」（MainLayout.vue:126-132）或整页刷新恢复，每次会话过期必然复现。",
+        "location": "dev/frontend/src/api/index.js:29-35; dev/frontend/src/router/index.js:151-157",
+        "severity": "严重",
+        "title": "401 拦截器只清 localStorage 不清 Pinia store，登录页被守卫弹回 Dashboard，过期会话陷入跳转死结"
+      },
+      {
+        "evidence": "`const res = await userApi.list(); const users = res.results || res || []; authors.value = users.filter(u => (u.roles || []).includes('AUTHOR'))`。后端 users/views.py list 走 super().list()，settings.py `'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination', 'PAGE_SIZE': 20`，且未配置 page_size_query_param。",
+        "impact": "系统用户总数超过 20 后，第 2 页起的作者账号在下拉框中永远不出现，编辑部无法为这些作者创建任务，且无任何错误提示；过滤逻辑完全依赖客户端，缺页即静默丢数据。",
+        "location": "dev/frontend/src/views/tasks/TaskCreate.vue:274-276",
+        "severity": "一般",
+        "title": "创建任务的作者下拉只加载 /users/ 第一页（20 条）后再客户端过滤 AUTHOR，超出部分的作者静默缺失"
+      },
+      {
+        "evidence": "`} catch (e) { ElMessage.error('上传失败') } finally { uploading.value = false }` —— 不 rethrow、不调用 uploadRef.clearFiles()、不标记失败。el-upload 对自定义 http-request 以返回 Promise 判定状态，resolve 即置为 success；模板中 `:limit=\"1\"`，form.manuscript_file 仅在成功分支赋值（`form.manuscript_file = res.file_path`）。",
+        "impact": "上传失败（网络错误/后端 500/超 20MB 校验外的情况）后文件列表仍显示该文件为成功状态，form.manuscript_file 保持 ''；再选新文件触发 limit 超限警告，须先手动移除残留项；直到点「创建任务」才报「请上传稿件PDF」，编辑部极易误以为文件已上传。",
+        "location": "dev/frontend/src/views/tasks/TaskCreate.vue:222-241,73",
+        "severity": "一般",
+        "title": "上传失败被 catch 吞掉不 rethrow，el-upload 显示假成功且 limit=1 阻止重新上传"
+      },
+      {
+        "evidence": "前端：`if (!formData.comments[dim.dimensionId] || formData.comments[dim.dimensionId].length < minWords)` 与 `formData.overall_comment.length < 100`（未 strip 的原始长度）。后端 forms/services.py validate_opinion：`comment_cleaned = comment.strip(); if len(comment_cleaned) < min_words`（overall_comment 同样 strip 后计数）。",
+        "impact": "以空格/换行/缩进凑字数的评语能通过前端校验并进入提交确认框，后端 submit 校验拒绝返回 400，且错误体为 DRF 字段错误形状（无 detail/error 键）被拦截器显示为笼统的「请求参数错误」，审稿人不知道具体差在哪一项。",
+        "location": "dev/frontend/src/views/review/ReviewForm.vue:283,292; dev/backend/apps/forms/services.py:138-143,163-166",
+        "severity": "一般",
+        "title": "审稿字数校验口径不一致：前端按原始字符串 length 计数，后端按 strip 后长度校验，边界输入前端放行、后端 400"
+      },
+      {
+        "evidence": "前端：`autoSaveTimer = setInterval(async () => { if (hasChanges && formData.recommendation) { await saveDraft(true) } }, 60000)`，confirmSubmit 期间不停止计时器也不重置 hasChanges。后端 save_draft：入口 `if assignment.assignment_status == 'SUBMITTED': return 400`（views.py:509），随后 `.filter(assignment=assignment, round=1, status='DRAFT').first()` 为空则 `ReviewOpinion.objects.create(..., status='DRAFT')`（views.py:540-551），无锁无事务。submit 是将 DRAFT 行原地更新为 SUBMITTED（views.py:395-407）。my_opinion：`.filter(task=task, reviewer=user, round=1).first()`（views.py:594-596）无 status 过滤、无 ordering。",
+        "impact": "自动保存请求与提交事务交错时（save_draft 已通过入口检查、submit 先后提交），会产生同一 assignment 下 SUBMITTED + DRAFT 两行意见记录；my_opinion 无序取 first 可能返回 DRAFT，使发现「已提交者重进表单看到空白/旧草稿」进一步恶化，形成可编辑假象，再提交报「您已提交过审稿意见」。",
+        "location": "dev/frontend/src/views/review/ReviewForm.vue:239-245; dev/backend/apps/forms/views.py:509-551,594-596",
+        "severity": "一般",
+        "title": "（待核实）60 秒自动保存与提交并发可在 SUBMITTED 之后重建 DRAFT 行，且 my_opinion 取值无序"
+      },
+      {
+        "evidence": "`const draft = await formApi.myOpinion(taskId); if (draft && draft.status === 'DRAFT') { ...回填... }` —— status==='SUBMITTED' 时不回填也不切换只读视图；startAutoSave 在 onMounted 无条件启动：`autoSaveTimer = setInterval(...)`，触发条件仅 `hasChanges && formData.recommendation`。",
+        "impact": "审稿人提交后从「我的任务」误点回审稿工作台（该入口始终存在），看到全空表单误以为意见丢失；重新填写并选择推荐意见后，每 60 秒自动保存收到 400「已提交审稿意见，不可再保存草稿」弹一次错误，点提交又报「您已提交过审稿意见」。",
+        "location": "dev/frontend/src/views/review/ReviewForm.vue:379-394,239-245",
+        "severity": "一般",
+        "title": "已提交审稿人重进审稿工作台得到空白可编辑表单，自动保存每 60 秒报一次 400"
+      },
+      {
+        "evidence": "`const submitReview = async (decision) => { ... try { await knowledgeApi.reviewAnonymization(...); reviewDialog.value = false; fetchList() } catch (e) { /* handled */ } finally { submitting.value = false } }` 不返回成败；handleApprove：`await submitReview('APPROVED'); ElMessage.success('审核通过，已归档到知识库')`（handleReject、handleExclude 同样无条件弹成功）。",
+        "impact": "审核接口失败（网络异常、后端校验不通过等）时对话框不关闭，却弹出「审核通过，已归档」成功提示；编辑部误以为条目已处理完成，实际它仍留在待审核队列，造成漏审。",
+        "location": "dev/frontend/src/views/knowledge/KnowledgeReview.vue:141-167,170-191",
+        "severity": "一般",
+        "title": "匿名化审核三个动作在接口失败时仍无条件弹出成功提示"
+      },
+      {
+        "evidence": "接受按钮：`<el-button type=\"success\" :loading=\"actionLoading[a.assignment_id]\" @click=\"handleAccept(a)\">接受邀请</el-button>`；拒绝按钮：`<el-button type=\"danger\" plain @click=\"openRejectDialog(a)\">拒绝</el-button>` 无任何禁用绑定。两个 handler 独立调用 `taskApi.acceptInvitation(a.task)` 与 `taskApi.rejectInvitation(..., {reason})`，后端两个接口亦无行锁。",
+        "impact": "用户确认接受后（请求进行中）仍可打开拒绝对话框并确认，两个请求并发到达后端，最终分配状态取决于到达顺序；UI 先后弹出的「已接受邀请」「已拒绝邀请」两个成功提示互相矛盾，且与实际状态可能不符。",
+        "location": "dev/frontend/src/views/tasks/MyTasks.vue:100-107,221-266",
+        "severity": "一般",
+        "title": "接受邀请请求进行中时拒绝按钮仍可点击，接受/拒绝可并发发出"
+      },
+      {
+        "evidence": "`const res = await taskApi.dashboard({ status: 'SUBMITTED' }); pendingTasks.value = res.results || res || []`（dashboard 为 PAGE_SIZE=20 分页，无翻页）；fetchPendingTasks 仅在 onMounted 调用（`onMounted(() => { fetchList(); fetchPendingTasks() })`），handleGenerate 成功后只执行 `fetchList()` 不刷新 pendingTasks。",
+        "impact": "待汇总任务超过 20 条时第 2 页之后的任务无法从生成对话框中选择，只能手敲 URL 绕过；生成成功后该任务仍留在下拉列表中，再次打开对话框可重复选中同一任务发起生成，依赖后端报错兜底。",
+        "location": "dev/frontend/src/views/summaries/SummaryList.vue:101-107,128-131",
+        "severity": "一般",
+        "title": "生成汇总对话框的待汇总任务列表只取 dashboard 第一页且仅在挂载时获取一次，生成后不刷新"
+      },
+      {
+        "evidence": "state 仅初始化一次：`token: localStorage.getItem('access_token') || '', user: JSON.parse(...)`；logout() 只清本 tab 的 store 与 localStorage；对 src 全目录 grep 'storage' 零命中，无任何 `window.addEventListener('storage', ...)`。",
+        "impact": "A 标签退出后，B 标签 Pinia store 仍持有旧 token，界面保持登录态继续操作；每次请求都 401 并触发「严重」项的弹回循环与连串错误 toast，体验为「登出了还一直报登录过期」。",
+        "location": "dev/frontend/src/stores/auth.js:4-8,50-56",
+        "severity": "一般",
+        "title": "auth store 无 storage 事件监听，多标签页登出状态不同步"
+      },
+      {
+        "evidence": "`new_password = serializers.CharField(min_length=8, style={'input_type': 'password'}, help_text='至少8位')` —— 未接 validate_password/AUTH_PASSWORD_VALIDATORS，无复杂度要求。apps/users/test_p0_security.py 仅覆盖旧密码错误、修改成功、长度下限三种情形，无用例断言纯弱密码被拒。",
+        "impact": "P0 批次新增的改密通道接受 '12345678'、'aaaaaaaa' 等弱密码；结合存量账号默认密码 'changeme123'（create 通道，轮 1 已报），弱口令可长期存续且没有回归测试防线，测试文件名中的 security 与实际强度保障不符。",
+        "location": "dev/backend/apps/users/serializers.py:75-81",
+        "severity": "一般",
+        "title": "P0 新增的 change_password 只校验 8 位长度，无密码强度校验，也没有对应的弱密码回归测试"
+      },
+      {
+        "evidence": "`self.client.post(f'/api/tasks/{self.task.task_id}/make_decision/', {'decision': 'ACCEPT', 'notes': notes}, format='json')`（无赋值、无状态码断言），随后仅对第二次 POST 断言 `self.assertEqual(resp.status_code, 400)  # 已 DECIDED，不允许再次决策`。",
+        "impact": "若 make_decision 因任何回归在第一次调用即返回 400（任务未到 SUMMARIZED、参数问题等），第二次同样 400，断言依然通过——「已 DECIDED 拒绝再次决策」这一状态守卫行为实际从未被证明，测试给出虚假的回归保护。",
+        "location": "dev/backend/apps/tasks/test_p0_fixes.py:116-126",
+        "severity": "一般",
+        "title": "双重决策测试对第一次 make_decision 的结果不做任何断言，属空转断言"
+      },
+      {
+        "evidence": "文件头注释：「-> 自动转SUBMITTED -> 生成汇总报告 -> 录入终审决策 -> 验证状态日志与通知」，第 133 行 `print('== 10. 作者侧可见性（通知+稿件列表）==')`，但全文 grep 无 notifications 端点调用或任何通知断言。单元测试中仅覆盖 SUMMARIZE 通知（summaries/tests.py:257-261）与「分配困难」阈值通知（tasks/tests.py:114-126），forms/views.py:434 的 `NotificationService.send_submit(opinion)` 等路径无测试。",
+        "impact": "分配/接受/拒绝/提交/终审决策五类通知（Notification.Type 中占大多数）的触发与内容完全无自动化验证，通知漏发或内容错误只能靠人工发现；E2E 文档声称的覆盖与实际不符，会误导后续维护者以为通知链路已被验证。",
+        "location": "dev/backend/scripts/e2e_smoke.py:4,133",
+        "severity": "一般",
+        "title": "E2E 冒烟脚本声称「验证状态日志与通知」但全程未调用通知接口，ASSIGN/ACCEPT/REJECT/SUBMIT/DECISION 五类通知无任何测试"
+      },
+      {
+        "evidence": "apps/forms 目录仅有 test_p0_idor.py（4 例，全部为权限归属测试）；无 tests.py。submit 的维度完整性/字数下限/重复提交 400、save_draft 的宽松校验与 DRAFT→SUBMITTED 原地升级、my_opinion 回显均无单元测试，唯一覆盖是 e2e_smoke 的 happy path（需活动服务器 + Demo@2026 种子账号，无法进 CI）。apps/knowledge 仅有 test_anonymization.py（10 例服务层测试），search/pending_reviews/review_anonymization 端点零测试。",
+        "impact": "本轮发现的字数口径不一致、自动保存竞态等问题恰恰位于这些无测试路径上；一旦 min_words 口径或 DRAFT 升级逻辑回归，86 个测试全绿也发现不了，且唯一覆盖路径（E2E）无法纳入日常回归。",
+        "location": "dev/backend/apps/forms/（仅 test_p0_idor.py 4 例）; dev/backend/apps/knowledge/（仅 test_anonymization.py 服务层 10 例）",
+        "severity": "一般",
+        "title": "forms 模块提交/草稿核心逻辑与 knowledge 检索/审核端点零单元测试，仅剩 IDOR 和服务层测试"
+      },
+      {
+        "evidence": "`user: JSON.parse(localStorage.getItem('user_info') || 'null')` —— store 创建即执行，无 try/catch。",
+        "impact": "user_info 一旦为非合法 JSON 字符串（浏览器插件改写、旧版本残留格式、手工篡改），Pinia store 初始化抛异常导致应用启动白屏，且报错发生在渲染之前，用户无从自救（连登录页都进不去），只能清站点数据。",
+        "location": "dev/frontend/src/stores/auth.js:7",
+        "severity": "建议",
+        "title": "auth store 初始化时 JSON.parse 无容错，localStorage 中 user_info 损坏即整站白屏"
+      },
+      {
+        "evidence": "`const dl = new Date(deadline)`（deadline 为 'YYYY-MM-DD' 字符串时按 UTC 零点解析，Asia/Shanghai 即本地 08:00）；`const diff = Math.ceil((dl - now) / (1000 * 60 * 60 * 24))`。settings.py 配置 TIME_ZONE='Asia/Shanghai'。",
+        "impact": "截止日当天 08:00 起即显示红色「剩余 0 天」，次日「已超期 N 天」也要等到 08:00 才出现；TaskList 的 isOverdue 红色警告与 MyTasks 的超期标签同样整体偏移 8 小时，与「截止日全天有效」的自然预期不符。",
+        "location": "dev/frontend/src/utils/status.js:59-65",
+        "severity": "建议",
+        "title": "daysRemaining 对纯日期字符串按 UTC 零点解析，剩余天数/超期判定在东八区整体偏移 8 小时"
+      },
+      {
+        "evidence": "`const params = { page: page.value }; if (filters.status) params.status = filters.status; if (filters.subject) params.subject = filters.subject`（keyword 不发后端）；`rows = rows.filter(t => (t.title || '').toLowerCase().includes(kw) || (t.task_id || '').toLowerCase().includes(kw))`；`total.value = res.count || rows.length`；`statusCounts` 遍历 `list.value` 现算。",
+        "impact": "标题/编号搜索只能命中当前页 20 条内的记录，翻页后结果集变化，用户以为「搜不到」；四张统计卡片数值随翻页变动而非全局统计；分页器 total 用的是未过滤的 count，与表格实际行数不一致。",
+        "location": "dev/frontend/src/views/tasks/TaskList.vue:148-161,118-124",
+        "severity": "建议",
+        "title": "任务看板 keyword 仅过滤当前页数据、统计卡片只统计当前页、分页 total 用未过滤 count，三者口径互相矛盾"
+      },
+      {
+        "evidence": "`const res = await taskApi.myArticles({ page: currentPage.value, page_size: pageSize.value }); articles.value = res.results || res || []` —— 后端 my_articles 不做分页直接返回全量列表（apps/tasks/views.py:335-369 区段），前端拿到后无任何切片。",
+        "impact": "稿件超过 20 篇时翻页控件出现并可点击，但每页渲染的都是同一份全量数据（第 1 页和第 3 页内容相同），作者会误以为数据重复或丢失。",
+        "location": "dev/frontend/src/views/tasks/MyArticles.vue:130-138",
+        "severity": "建议",
+        "title": "我的稿件分页为摆设：向后端发送 page/page_size 但后端不分页，前端也不切片"
+      },
+      {
+        "evidence": "前端：`notificationApi.list({ page_size: 5 })` / `notificationApi.list({ page_size: 50 })`。后端 settings.py：`'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination', 'PAGE_SIZE': 20`，未设置 `PAGE_SIZE_QUERY_PARAM`，自定义 page_size 参数被静默忽略。",
+        "impact": "工作台「最近通知」实际显示最多 20 条而非 5 条，布局与设计意图不符；通知抽屉声称取 50 条实际只有 20 条，且组件无加载更多入口，第 21 条之后的通知在前端不可达（只能去后端直查）。",
+        "location": "dev/frontend/src/views/Dashboard.vue:197; dev/frontend/src/components/NotificationList.vue:89; dev/backend/review_platform/settings.py:138-139",
+        "severity": "建议",
+        "title": "通知列表的 page_size 查询参数后端不识别，取回条数与前端预期不符"
+      },
+      {
+        "evidence": "三条路由定义均无 `meta: { roles: [...] }`；守卫仅拦截有 roles 的路由：`if (to.meta.roles && !to.meta.roles.some(...)) { next({ name: 'Dashboard' }) }`，且角色不符时静默跳转无提示。后端汇总详情仅编辑部可访问。",
+        "impact": "审稿人/作者直接访问 /summaries/:taskId 等路径时进入空白页面并弹「没有权限执行此操作」toast，无任何引导；角色不符被踢回 Dashboard 时同样无提示，用户不知道为何跳转。（与轮 1 已报的 TaskDetail 按钮级 403 同源，本条为路由层缺口）",
+        "location": "dev/frontend/src/router/index.js:36-40,66-71,98-103,165-169",
+        "severity": "建议",
+        "title": "opinions/:taskId、summaries/:taskId、tasks/:id 等路由无 roles 元信息，越权访问后端 403 后仅剩空页面与错误 toast"
+      },
+      {
+        "evidence": "TaskCreate.vue：`:disabled-date=\"(d) => d < new Date()\"` —— 当天零点必然小于当前时刻，当天被禁选。TaskAssign.vue：`const disabledDate = (date) => { return date.getTime() < Date.now() - 86400000 }` —— 当天可选。",
+        "impact": "编辑部当天创建任务时无法将审稿截止日定为今天，而随后分配审稿人时同一任务的截止日却可选今天；两个相邻页面同一语义字段行为不一致，后端本身接受任意日期。",
+        "location": "dev/frontend/src/views/tasks/TaskCreate.vue:133; dev/frontend/src/views/tasks/TaskAssign.vue:209-211",
+        "severity": "建议",
+        "title": "创建任务与分配审稿人的截止日期禁用规则不一致：TaskCreate 禁选当天，TaskAssign 允许选今天"
+      },
+      {
+        "evidence": "package.json 的 scripts 中无 test 项，devDependencies 中无 vitest/jest/@testing-library/cypress 等任何测试框架（此前完整读取确认）。",
+        "impact": "P1 批次 18 处视图层契约对齐（res.count/results 双形状兜底、字段改名、assignment/task 键位）与本次发现的拦截器/守卫/store 逻辑均无回归防线，后端字段再调整时只能人工逐页点检，回归成本高且易漏。",
+        "location": "dev/frontend/package.json",
+        "severity": "建议",
+        "title": "前端零测试基础设施，P1 契约对齐成果无任何回归保护"
+      }
+    ],
+    "checked_ok": [
+      "Dashboard.vue:150-159 编辑部翻页取全循环不会死循环：`total = res.count || all.length`，count 缺失时 total=all.length 立即 break，count 存在时空页 break；后端 dashboard 为标准分页必返 count/results",
+      "REVIEWER/AUTHOR 工作台统计基于全量数据：my_tasks/my_articles 后端不分页直接返回全量列表（apps/tasks/views.py:335-369），前端 `res.results || res` 双形状兜底均能取全",
+      "dashboard 端点 status/subject 服务端筛选生效（apps/tasks/views.py:300-333），TaskList 复用时状态/学科筛选真实有效（仅 keyword 为前端过滤，已另报）",
+      "KnowledgeSearch.vue 月份区间 `value-format=\"YYYY-MM\"` 与后端 `datetime.strptime(f'{v}-01', '%Y-%m-%d')` 解析口径一致（apps/knowledge/services.py:483-505），无格式错位",
+      "KnowledgeSearch score_range 取值 'high'/'mid_high' 与后端映射键一致（该过滤条件恒空的缺陷轮 1 #383 已报，本轮不重复计）",
+      "make_decision 先落库再转状态的修复成立且测试得法：test_decision_fields_persist_in_db 用 refresh_from_db + 独立 GET 请求二次验证，杜绝内存序列化假象",
+      "force_summarize AC-T-11 五项要素测试齐备：reason 必填、无已提交意见 400、未提交者标 EXPIRED（marked_expired=1）、非 REVIEWING 400、非编辑部 403",
+      "DECIDED 自动匿名化归档与 _strip_identity_keys 递归脱敏：apps/knowledge/test_anonymization.py 10 例覆盖嵌套 list/dict、identityKey/identity_key 双命名及各类身份键",
+      "state_logs 审稿人操作者脱敏 3 例（作者见「审稿人」/编辑部见真名/无关作者 404）；双盲序列化 4 例（作者任何模式不可见审稿人身份、双盲互不可见、单盲审稿人可见作者、编辑部全见）",
+      "文件下载对象级权限四主体矩阵 8 例测试（编辑部/上传人/稿件作者/被分配审稿人/无关者），且权限校验先于磁盘路径拼接（403 不泄露文件存在性）",
+      "UserViewSet CRUD 收口与 change_password 旧密码校验均有测试：users/test_p0_security.py 13 例 + users/tests.py 10 例（登录成功/错误密码/未知用户/邮箱登录、创建账号权限、默认密码可登录）",
+      "汇总规则引擎测试充分：summaries/tests.py 17 例覆盖 Rule-1~7 优先级（Rule7>Rule6、Rule4>Rule6）、冲突/共识分析、generate 全流程（含 DB 字段落库与 SUMMARIZE 通知断言）、错误状态 400",
+      "状态机测试充分：tasks/tests.py 9 例含 AC-T-14 三人并发提交仅单次状态转换（TransactionTestCase + threading）与分配困难通知阈值（第 4 次重试通知编辑部）",
+      "task_opinions 归属收口 4 例 IDOR 测试（审稿人仅自己、作者仅本人稿件已提交意见、无关者拒绝）",
+      "86 个测试用例计数与决策日志声称一致（8 个测试文件 13+15+4+8+10+9+10+17=86 逐一核实）",
+      "ReviewForm buildPayload 与草稿回填字段对称：dimension_scores 数组与 scores/comments 映射互转一致、revision_suggestions 按行拆分/合并一致；onUnmounted 正确清理自动保存计时器与 beforeunload 监听",
+      "TaskCreate 匿名化检查已改用 uploadedFile.file_id 调用 checkMetadata，与后端 FileCheckResponseSerializer 字段对齐（轮 1 #407 修复生效）；表单字段名与 ReviewTaskCreateSerializer 完全对齐",
+      "TaskDecision 综合评语不少于 100 字前后端口径一致；TemplateList 以 status:'' 获取全量模板与后端空值不过滤的逻辑兼容",
+      "登录 redirect 未发现可利用的开放重定向：router.push 对跨源 URL 经 history.pushState 抛 SecurityError，不会发生导航跳转",
+      "RefValidation.vue 进度计时器在 finally 中 clearInterval，无泄漏；结果渲染含 result.error 降级路径",
+      "e2e_smoke.py 覆盖完整 happy path（登录→建稿→分配→接受→提交→自动转 SUBMITTED→生成汇总→终审→状态日志）且逐步断言状态码与关键字段值"
+    ]
+  }
+]
