@@ -9,6 +9,7 @@ from .serializers import (
     UserSerializer, UserCreateSerializer, UserAdminSerializer,
     UserProfileSerializer, ChangePasswordSerializer, LoginSerializer,
 )
+from .throttling import LoginMinuteThrottle, LoginDailyThrottle
 
 
 class UserViewSet(viewsets.ModelViewSet):
@@ -37,6 +38,15 @@ class UserViewSet(viewsets.ModelViewSet):
         if self.action == 'change_password':
             return ChangePasswordSerializer
         return UserSerializer
+
+    def get_throttles(self):
+        """#016 安全项1：仅登录接口限流（防暴力破解）——10 次/分钟/IP + 50 次/天/IP，
+        超限返回 429；档位见 settings.REST_FRAMEWORK['DEFAULT_THROTTLE_RATES']。
+        按 self.action 局部生效，其余接口不限流（含手动 as_view 注册的 login 路由）。
+        """
+        if self.action == 'login':
+            return [LoginMinuteThrottle(), LoginDailyThrottle()]
+        return super().get_throttles()
 
     # ==================== 编辑部用户管理 ====================
 
@@ -86,7 +96,11 @@ class UserViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=['post'], permission_classes=[AllowAny])
     def login(self, request):
-        """用户登录 - 返回JWT token"""
+        """用户登录 - 返回JWT token
+
+        #016 安全项1：登录限流（防暴力破解）——10 次/分钟/IP + 50 次/天/IP，
+        超限返回 429；正常使用与 E2E 冒烟（5 次登录）均在限值内。
+        """
         serializer = LoginSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         email = serializer.validated_data['email']

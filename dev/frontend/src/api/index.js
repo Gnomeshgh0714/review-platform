@@ -20,11 +20,50 @@ api.interceptors.request.use(
   (error) => Promise.reject(error)
 )
 
+// #016 安全项3：401 → 用 refresh_token 静默换新 token 并重放原请求
+// 后端已开 ROTATE_REFRESH_TOKENS：刷新响应会同时下发新 refresh，必须一并
+// 更新 localStorage（旧 refresh 已被拉黑，若只更新 access，第二次刷新必失败）；
+// 刷新不可用/失败时回落到原有 401 登出流程。
+// 登录接口与刷新接口自身的 401 不触发重放（凭据错误/refresh 失效属正常业务结果）
+let refreshing = null // 在途刷新 Promise：并发 401 只触发一次刷新请求
+
+async function tryRefreshAndRetry(config) {
+  const refreshToken = localStorage.getItem('refresh_token')
+  const excluded = ['/users/login/', '/users/token/refresh/']
+  if (!refreshToken || config?._retried || excluded.some((u) => (config?.url || '').includes(u))) {
+    return null
+  }
+  if (!refreshing) {
+    refreshing = axios
+      .post('/api/users/token/refresh/', { refresh: refreshToken })
+      .then(({ data }) => {
+        localStorage.setItem('access_token', data.access)
+        // 轮换开启：响应携带新 refresh，同步更新存储，否则旧值下次刷新即 401
+        if (data.refresh) localStorage.setItem('refresh_token', data.refresh)
+        useAuthStore().token = data.access
+        return data
+      })
+      .finally(() => { refreshing = null })
+  }
+  const data = await refreshing.catch(() => null)
+  if (!data) return null
+  config._retried = true
+  config.headers = config.headers || {}
+  config.headers.Authorization = `Bearer ${data.access}`
+  return api(config)
+}
+
 // 响应拦截器：统一错误处理
 api.interceptors.response.use(
   (response) => response.data,
-  (error) => {
+  async (error) => {
     const { response, config } = error
+    // #016 安全项3：先尝试静默刷新重放（成功则业务层无感）；
+    // 不可刷新（无 token/已重试过/刷新失败）时走原有 401 登出流程
+    if (response?.status === 401) {
+      const retried = await tryRefreshAndRetry(config)
+      if (retried) return retried
+    }
     // #015 遗留2：部分接口的 404 属正常业务空态（如 my_opinion 无草稿），
     // 调用处可在请求 config 传 silent404: true 跳过全局「请求的资源不存在」toast；
     // 其余状态码与其他页面的 404 提示均不受影响

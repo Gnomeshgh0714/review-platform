@@ -46,6 +46,8 @@ INSTALLED_APPS = [
     # Third-party
     'rest_framework',
     'rest_framework_simplejwt',
+    # #016 安全项3：refresh_token 轮换的黑名单存储（需执行 migrate 建表）
+    'rest_framework_simplejwt.token_blacklist',
     'corsheaders',
     # Local apps
     'apps.users',
@@ -137,6 +139,14 @@ REST_FRAMEWORK = {
     ),
     'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
     'PAGE_SIZE': 20,
+    # #016 安全项1：登录限流档位（防暴力破解）——仅登录视图局部引用（见
+    # apps/users/throttling.py），未设全局 DEFAULT_THROTTLE_CLASSES，其他接口不受影响。
+    # 分钟档 10 次/分钟/IP 拦高频撞库（正常输错重试与 E2E 冒烟 5 次登录远低于此）；
+    # 每日档 50 次/天/IP 兜底慢速尝试（较常见实践 100/day 从严，演示环境够用）
+    'DEFAULT_THROTTLE_RATES': {
+        'login_minute': '10/min',
+        'login_daily': '50/day',
+    },
 }
 
 from datetime import timedelta
@@ -145,10 +155,20 @@ SIMPLE_JWT = {
     'REFRESH_TOKEN_LIFETIME': timedelta(days=7),
     'USER_ID_FIELD': 'user_id',
     'USER_ID_CLAIM': 'user_id',
+    # #016 安全项3：refresh_token 轮换——刷新时签发新 refresh 并将旧 token 拉黑，
+    # 泄露的旧 refresh 无法二次使用；刷新端点见 apps/users/urls.py 的
+    # users/token/refresh/（TokenRefreshView），黑名单表来自 token_blacklist 迁移
+    'ROTATE_REFRESH_TOKENS': True,
+    'BLACKLIST_AFTER_ROTATION': True,
 }
 
-# CORS
-CORS_ALLOW_ALL_ORIGINS = True
+# CORS（#016 安全项2：白名单收紧，替换原 CORS_ALLOW_ALL_ORIGINS = True 的全放开）
+# 本地开发内置 Vite dev server 两个来源；生产经环境变量 CORS_ALLOWED_ORIGINS
+# 扩展（逗号分隔，见 backend/.env.example）。E2E/测试直连 127.0.0.1 不走 CORS 预检，不受影响
+CORS_ALLOWED_ORIGINS = [
+    'http://localhost:5173',
+    'http://127.0.0.1:5173',
+] + [o.strip() for o in os.environ.get('CORS_ALLOWED_ORIGINS', '').split(',') if o.strip()]
 
 # Celery
 CELERY_BROKER_URL = 'redis://localhost:6379/0'
