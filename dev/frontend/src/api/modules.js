@@ -62,7 +62,9 @@ export const formApi = {
   validateReferences: (taskId) => api.post('/forms/validate_references/', { task_id: taskId }, { timeout: 300000 }),
   submitOpinion: (data) => api.post('/opinions/submit/', data),
   saveDraft: (data) => api.post('/opinions/save_draft/', data),
-  myOpinion: (taskId) => api.get('/opinions/my_opinion/', { params: { task_id: taskId } }),
+  // #015 遗留2：my_opinion 无记录时后端正常返回 404（业务空态），
+  // 传 silent404 避免全局拦截器误弹「请求的资源不存在」toast
+  myOpinion: (taskId) => api.get('/opinions/my_opinion/', { params: { task_id: taskId }, silent404: true }),
   taskOpinions: (taskId) => api.get('/opinions/task_opinions/', { params: { task_id: taskId } }),
 }
 

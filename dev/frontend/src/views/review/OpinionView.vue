@@ -29,9 +29,9 @@
         <template #header>
           <div class="flex-between">
             <div class="flex-center gap-12">
-              <span class="reviewer-label">
-                {{ isEditor && opinion.reviewer_name ? `审稿人 ${idx + 1}（${opinion.reviewer_name}）` : `审稿人 ${idx + 1}` }}
-              </span>
+              <span class="reviewer-label">{{ opinionTitle(opinion, idx) }}</span>
+              <!-- #015 遗留1：审稿人视角可能看到未提交的草稿，加标记区分提交状态 -->
+              <el-tag v-if="isMyOpinionView && opinion.status === 'DRAFT'" type="info" size="small">草稿</el-tag>
               <el-tag v-if="opinion.recommendation" :type="getRecTag(opinion.recommendation).color" size="small">
                 {{ getRecTag(opinion.recommendation).label }}
               </el-tag>
@@ -85,9 +85,21 @@ const opinions = ref([])
 
 const isEditor = computed(() => auth.isEditor)
 
+// #015 遗留1：后端 task_opinions 明确禁止审稿人访问（403），审稿人从「我的任务-查看意见」
+// 进入本页时应改走 my_opinion 展示本人意见；分流优先级与后端权限对齐：编辑部 > 作者 > 审稿人
+const isMyOpinionView = computed(() => !auth.isEditor && !auth.isAuthor)
+
 const statusTag = computed(() => TASK_STATUS[taskInfo.value.status] || { label: '-', color: 'info' })
 
 const getRecTag = (rec) => RECOMMENDATION[rec] || { label: rec, color: 'info' }
+
+// #015 遗留1：审稿人视角看的是本人意见，直接标明归属，避免误读为他人意见
+const opinionTitle = (opinion, idx) => {
+  if (isMyOpinionView.value) return '我的审稿意见'
+  return isEditor.value && opinion.reviewer_name
+    ? `审稿人 ${idx + 1}（${opinion.reviewer_name}）`
+    : `审稿人 ${idx + 1}`
+}
 
 // 维度评分：编辑部视角有 dimension_scores_detail（含维度名配置），
 // 作者视角为匿名化结果，仅含 dimension_scores 数组
@@ -104,14 +116,25 @@ const formatDimensionScores = (opinion) => {
 const fetchData = async () => {
   loading.value = true
   try {
-    const [task, opRes] = await Promise.all([
-      taskApi.retrieve(taskId),
-      formApi.taskOpinions(taskId),
-    ])
+    const task = await taskApi.retrieve(taskId)
     taskInfo.value = task
-    opinions.value = opRes.results || opRes || []
+
+    // #015 遗留1：审稿人视角走 my_opinion（返回单个对象，无记录 404 按空态处理）；
+    // 编辑部/作者仍走 task_opinions，行为不变。意见查询单独捕获，
+    // 避免无意见/异常时连任务信息都无法渲染
+    try {
+      if (isMyOpinionView.value) {
+        const mine = await formApi.myOpinion(taskId)
+        opinions.value = mine ? [mine] : []
+      } else {
+        const opRes = await formApi.taskOpinions(taskId)
+        opinions.value = opRes.results || opRes || []
+      }
+    } catch (e) {
+      console.error('Failed to fetch opinions:', e)
+    }
   } catch (e) {
-    console.error('Failed to fetch opinions:', e)
+    console.error('Failed to fetch task:', e)
   } finally {
     loading.value = false
   }

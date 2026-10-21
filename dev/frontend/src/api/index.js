@@ -24,7 +24,13 @@ api.interceptors.request.use(
 api.interceptors.response.use(
   (response) => response.data,
   (error) => {
-    const { response } = error
+    const { response, config } = error
+    // #015 遗留2：部分接口的 404 属正常业务空态（如 my_opinion 无草稿），
+    // 调用处可在请求 config 传 silent404: true 跳过全局「请求的资源不存在」toast；
+    // 其余状态码与其他页面的 404 提示均不受影响
+    if (config?.silent404 && response?.status === 404) {
+      return Promise.reject(error)
+    }
     if (response) {
       switch (response.status) {
         case 401:
