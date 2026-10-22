@@ -18,6 +18,16 @@
     </el-card>
 
     <div v-loading="loading">
+      <!-- V1.2 一般#28：已提交意见回填后切只读，防止误改与自动保存每 60 秒报 400 -->
+      <el-alert
+        v-if="submitted"
+        type="success"
+        title="审稿意见已提交，以下内容为只读查看"
+        :closable="false"
+        show-icon
+        class="mb-16"
+      />
+
       <!-- AI 辅助审稿 -->
       <el-card shadow="never" class="mb-16">
         <div class="flex-between">
@@ -26,7 +36,8 @@
             <span class="ml-8" style="font-weight: 600;">AI 辅助审稿</span>
             <span class="text-muted text-sm ml-12">调用 AI 自动分析稿件，生成评分和评语草稿，审稿人可在基础上修改</span>
           </div>
-          <el-button type="primary" plain :loading="aiLoading" @click="handleAIReview" :disabled="aiDone">
+          <!-- V1.2 一般#28：已提交后禁用 AI 重新生成 -->
+          <el-button type="primary" plain :loading="aiLoading" @click="handleAIReview" :disabled="aiDone || submitted">
             <el-icon><MagicStick /></el-icon>
             {{ aiDone ? '已生成' : 'AI 生成审稿意见' }}
           </el-button>
@@ -55,7 +66,7 @@
             <el-row :gutter="16">
               <el-col :span="12">
                 <el-form-item label="评分（1-5分）" required>
-                  <el-radio-group v-model="formData.scores[dim.dimensionId]" @change="onFormChange">
+                  <el-radio-group v-model="formData.scores[dim.dimensionId]" :disabled="submitted" @change="onFormChange">
                     <el-radio-button v-for="n in 5" :key="n" :value="n">
                       {{ n }}分
                     </el-radio-button>
@@ -74,6 +85,7 @@
                     :maxlength="500"
                     show-word-limit
                     placeholder="请针对此维度撰写具体评审意见..."
+                    :disabled="submitted"
                     @input="onFormChange"
                   />
                 </el-form-item>
@@ -89,7 +101,7 @@
         <template #header><span>综合评价</span></template>
         <el-form label-position="top">
           <el-form-item label="总体推荐意见" required>
-            <el-radio-group v-model="formData.recommendation" @change="onFormChange">
+            <el-radio-group v-model="formData.recommendation" :disabled="submitted" @change="onFormChange">
               <el-radio value="ACCEPT">
                 <el-tag type="success" size="small">接收</el-tag>
               </el-radio>
@@ -113,6 +125,7 @@
               :maxlength="2000"
               show-word-limit
               placeholder="请对论文进行总体评价，包括主要贡献、存在的问题及修改建议..."
+              :disabled="submitted"
               @input="onFormChange"
             />
           </el-form-item>
@@ -125,6 +138,7 @@
               :maxlength="1000"
               show-word-limit
               placeholder="具体修改建议（按条目列出）"
+              :disabled="submitted"
               @input="onFormChange"
             />
           </el-form-item>
@@ -137,8 +151,11 @@
           <el-icon><Search /></el-icon> 参考文献验证
         </el-button>
         <el-button text @click="$router.push(`/opinions/${taskId}`)">查看已有意见</el-button>
-        <el-button @click="handleSaveDraft" :loading="savingDraft">保存草稿</el-button>
-        <el-button type="primary" @click="handleSubmit" :loading="submitting">提交审稿意见</el-button>
+        <!-- V1.2 一般#28：已提交后隐藏保存/提交入口，仅保留只读查看 -->
+        <template v-if="!submitted">
+          <el-button @click="handleSaveDraft" :loading="savingDraft">保存草稿</el-button>
+          <el-button type="primary" @click="handleSubmit" :loading="submitting">提交审稿意见</el-button>
+        </template>
       </div>
     </div>
 
@@ -156,7 +173,8 @@
             {{ dim.dimensionName }}: {{ formData.scores[dim.dimensionId] || '-' }}分；
           </span>
         </el-descriptions-item>
-        <el-descriptions-item label="综合评语字数">{{ formData.overall_comment?.length || 0 }} 字</el-descriptions-item>
+        <!-- V1.2 一般#27：展示口径与校验口径一致（trim 后长度） -->
+        <el-descriptions-item label="综合评语字数">{{ formData.overall_comment?.trim().length || 0 }} 字</el-descriptions-item>
       </el-descriptions>
       <template #footer>
         <el-button @click="submitDialog = false">取消</el-button>
@@ -179,6 +197,8 @@ const router = useRouter()
 const taskId = route.params.taskId
 
 const loading = ref(true)
+// V1.2 一般#28：意见已提交（my_opinion 返回 SUBMITTED）时整表切只读
+const submitted = ref(false)
 const savingDraft = ref(false)
 const submitting = ref(false)
 const submitDialog = ref(false)
@@ -238,7 +258,8 @@ const buildPayload = () => ({
 // 自动保存（60秒间隔）
 const startAutoSave = () => {
   autoSaveTimer = setInterval(async () => {
-    if (hasChanges && formData.recommendation) {
+    // V1.2 一般#28：已提交意见不再自动保存（save_draft 对 SUBMITTED 状态报 400）
+    if (hasChanges && !submitted.value && formData.recommendation) {
       await saveDraft(true)
     }
   }, 60000)
@@ -280,7 +301,10 @@ const validateForm = () => {
       return false
     }
     const minWords = dim.minWords || 50
-    if (!formData.comments[dim.dimensionId] || formData.comments[dim.dimensionId].length < minWords) {
+    // V1.2 一般#27：与后端 strip 后长度同口径（apps/forms/services.py），
+    // 空格凑字数前端不再放行（原按原始 length 校验，后端 400 被吞成笼统提示）
+    const commentLen = (formData.comments[dim.dimensionId] || '').trim().length
+    if (commentLen < minWords) {
       ElMessage.warning(`「${dim.dimensionName}」评语不少于${minWords}字`)
       return false
     }
@@ -289,7 +313,8 @@ const validateForm = () => {
     ElMessage.warning('请选择总体推荐意见')
     return false
   }
-  if (!formData.overall_comment || formData.overall_comment.length < 100) {
+  // V1.2 一般#27：综合评语同口径按 trim 后长度校验
+  if (!formData.overall_comment || formData.overall_comment.trim().length < 100) {
     ElMessage.warning('综合评语不少于100字')
     return false
   }
@@ -381,7 +406,9 @@ const fetchData = async () => {
     // 尝试加载已有草稿（dimension_scores 数组回填为映射）
     try {
       const draft = await formApi.myOpinion(taskId)
-      if (draft && draft.status === 'DRAFT') {
+      // V1.2 一般#28：SUBMITTED 意见同样回填并切只读——原先只回填 DRAFT，
+      // 已提交审稿人重进得到空白可编辑表单，自动保存每 60 秒报一次 400
+      if (draft && (draft.status === 'DRAFT' || draft.status === 'SUBMITTED')) {
         for (const ds of (draft.dimension_scores || [])) {
           const dimId = ds.dimensionId || ds.dimension_id
           if (ds.score !== null && ds.score !== undefined) {
@@ -393,6 +420,9 @@ const fetchData = async () => {
         formData.overall_comment = draft.overall_comment || ''
         formData.suggestions = (draft.revision_suggestions || []).join('\n')
         hasChanges = false
+        if (draft.status === 'SUBMITTED') {
+          submitted.value = true
+        }
       }
     } catch (e) { /* no draft yet */ }
   } catch (e) {

@@ -101,7 +101,9 @@
                   <el-button type="success" :loading="actionLoading[a.assignment_id]" @click="handleAccept(a)">
                     接受邀请
                   </el-button>
-                  <el-button type="danger" plain @click="openRejectDialog(a)">
+                  <!-- V1.2 一般#30：接受请求进行中禁用拒绝入口，防止接受/拒绝并发发出、
+                       UI 先后弹出两个互相矛盾的成功提示 -->
+                  <el-button type="danger" plain :disabled="actionLoading[a.assignment_id]" @click="openRejectDialog(a)">
                     拒绝
                   </el-button>
                 </template>

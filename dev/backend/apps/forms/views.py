@@ -12,7 +12,7 @@
 """
 import logging
 
-from django.db import transaction
+from django.db import IntegrityError, transaction
 from django.utils import timezone
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
@@ -531,31 +531,47 @@ class ReviewOpinionViewSet(viewsets.GenericViewSet):
         validated_data = serializer.validated_data
 
         # 获取或创建草稿
+        # V1.2 一般#12：并发自动保存（双开页面/两标签页同时过期触发）时
+        # get-or-create 存在竞态——assignment 为 OneToOne，双方同时 create
+        # 撞唯一约束直接 500；create 包保存点，IntegrityError 后重取已存在
+        # 草稿转更新
+        def _apply_draft(op):
+            op.dimension_scores = validated_data.get('dimension_scores', [])
+            op.recommendation = validated_data.get('recommendation') or ''
+            op.overall_comment = validated_data.get('overall_comment') or ''
+            op.revision_suggestions = validated_data.get('revision_suggestions', [])
+            op.save()
+
         opinion = ReviewOpinion.objects.filter(
             assignment=assignment, round=1, status='DRAFT'
         ).first()
 
         if opinion:
             # 更新已有草稿
-            opinion.dimension_scores = validated_data.get('dimension_scores', [])
-            opinion.recommendation = validated_data.get('recommendation') or ''
-            opinion.overall_comment = validated_data.get('overall_comment') or ''
-            opinion.revision_suggestions = validated_data.get('revision_suggestions', [])
-            opinion.save()
+            _apply_draft(opinion)
         else:
-            # 新建草稿
-            opinion = ReviewOpinion.objects.create(
-                task=task,
-                form=form,
-                assignment=assignment,
-                reviewer=user,
-                dimension_scores=validated_data.get('dimension_scores', []),
-                recommendation=validated_data.get('recommendation') or '',
-                overall_comment=validated_data.get('overall_comment') or '',
-                revision_suggestions=validated_data.get('revision_suggestions', []),
-                status='DRAFT',
-                round=1,
-            )
+            try:
+                with transaction.atomic():
+                    opinion = ReviewOpinion.objects.create(
+                        task=task,
+                        form=form,
+                        assignment=assignment,
+                        reviewer=user,
+                        dimension_scores=validated_data.get('dimension_scores', []),
+                        recommendation=validated_data.get('recommendation') or '',
+                        overall_comment=validated_data.get('overall_comment') or '',
+                        revision_suggestions=validated_data.get('revision_suggestions', []),
+                        status='DRAFT',
+                        round=1,
+                    )
+            except IntegrityError:
+                # 并发方已建草稿：重取转更新（仍为空则属其他异常，重新抛出）
+                opinion = ReviewOpinion.objects.filter(
+                    assignment=assignment, round=1, status='DRAFT'
+                ).first()
+                if opinion is None:
+                    raise
+                _apply_draft(opinion)
 
         return Response(
             {
@@ -598,9 +614,11 @@ class ReviewOpinionViewSet(viewsets.GenericViewSet):
             )
 
         # 审稿人只能查看自己的意见
+        # V1.2 一般#12：同轮次存在多条记录（草稿+已提交等场景）时 first()
+        # 无序取行不稳定，按更新时间倒序取最新一条
         opinion = ReviewOpinion.objects.filter(
             task=task, reviewer=user, round=1,
-        ).first()
+        ).order_by('-updated_at').first()
 
         if not opinion:
             return Response(

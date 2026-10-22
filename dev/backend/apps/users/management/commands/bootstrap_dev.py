@@ -14,7 +14,8 @@
 """
 import os
 
-from django.core.management.base import BaseCommand
+from django.conf import settings
+from django.core.management.base import BaseCommand, CommandError
 
 from apps.users.models import User
 
@@ -35,6 +36,13 @@ class Command(BaseCommand):
     help = '创建演示用户并初始化模板与知识库种子数据（幂等）'
 
     def handle(self, *args, **options):
+        # V1.2 一般#16：演示账号引导仅限开发环境——生产环境误执行会
+        # 创建已知口令账号，拒绝运行（需显式 DJANGO_DEBUG=True）
+        if not settings.DEBUG:
+            raise CommandError(
+                'bootstrap_dev 仅限开发环境（DEBUG=False 拒绝执行）；'
+                '确需运行请设置 DJANGO_DEBUG=True'
+            )
         password = os.environ.get('BOOTSTRAP_PASSWORD', 'Demo@2026')
 
         self.stdout.write('== 1/3 创建演示用户 ==')
@@ -70,9 +78,14 @@ class Command(BaseCommand):
 
         self.stdout.write('')
         if created:
+            # V1.2 一般#16：不在输出中回显口令，改为提示查看环境变量
             self.stdout.write(self.style.SUCCESS(
-                f'引导完成：新建 {len(created)} 个演示账号，密码均为 {password}（请尽快修改）。'
+                f'引导完成：新建 {len(created)} 个演示账号。'
             ))
+            self.stdout.write(
+                '演示密码取环境变量 BOOTSTRAP_PASSWORD（默认值见 .env.example），'
+                '首次登录后请尽快修改。'
+            )
             self.stdout.write('登录入口：POST /api/users/login/ {"email": "...", "password": "..."}')
         else:
             self.stdout.write('引导完成：演示账号均已存在，未做变更。')

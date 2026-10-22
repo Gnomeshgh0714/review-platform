@@ -1,8 +1,9 @@
 # 审稿协作平台 - Python 依赖（Python 3.14 / Django 5.2）
+# V1.2 一般#17：全线补版本上界锁定（可复现安装），并移除已停维护的
+# PyPDF2（PDF 解析已迁至 PyMuPDF，见 apps/files/services.py）
 Django>=5.2.4,<5.3
-djangorestframework>=3.16
-djangorestframework-simplejwt>=5.5
-django-cors-headers>=4.7
+djangorestframework>=3.16,<3.19
+djangorestframework-simplejwt>=5.5,<5.6
+django-cors-headers>=4.7,<5.0
 psycopg[binary]>=3.2,<4
-PyMuPDF>=1.26
-PyPDF2==3.0.1
+PyMuPDF>=1.26,<2.0

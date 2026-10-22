@@ -9,6 +9,7 @@
 - match_rule_preview：POST 预览规则匹配结果（不生成报告，仅返回匹配的规则，用于调试）
 """
 from collections import Counter
+from django.db import IntegrityError
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -121,6 +122,16 @@ class SummaryReportViewSet(viewsets.ViewSet):
             return Response({'error': str(e)}, status=400)
         except ValueError as e:
             return Response({'error': str(e)}, status=400)
+        except IntegrityError:
+            # V1.2 一般#8：并发重复触发（双击/双开）时，两事务各自
+            # SummaryReport(task=...) 插入撞 task 唯一约束会 500；此时另一
+            # 请求已生成报告，直接返回已存在报告（幂等）而非报错
+            try:
+                report = SummaryReport.objects.get(task=task)
+            except SummaryReport.DoesNotExist:
+                return Response({'error': '汇总报告生成冲突，请重试'}, status=409)
+            serializer = SummaryReportSerializer(report)
+            return Response(serializer.data, status=status.HTTP_200_OK)
 
         serializer = SummaryReportSerializer(report)
         return Response(serializer.data, status=status.HTTP_201_CREATED)

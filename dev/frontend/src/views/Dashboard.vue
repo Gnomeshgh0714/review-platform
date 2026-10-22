@@ -114,7 +114,8 @@ const statCards = computed(() => {
     { label: '我的稿件', value: stats.value.total || 0, icon: 'Document', color: '#409eff' },
     { label: '审稿中', value: stats.value.reviewing || 0, icon: 'EditPen', color: '#e6a23c' },
     { label: '已决策', value: stats.value.decided || 0, icon: 'Select', color: '#20c997' },
-    { label: '已归档', value: stats.value.archived || 0, icon: 'FolderOpened', color: '#909399' },
+    // V1.2 一般#3：后端无 ARCHIVED 任务状态（原统计恒 0），改为展示已汇总
+    { label: '已汇总', value: stats.value.summarized || 0, icon: 'DataAnalysis', color: '#909399' },
   ]
 })
 
@@ -184,7 +185,8 @@ const fetchDashboard = async () => {
         total: rows.length,
         reviewing: countBy('REVIEWING'),
         decided: countBy('DECIDED'),
-        archived: countBy('ARCHIVED'),
+        // V1.2 一般#3：ARCHIVED 为前端死键（后端无此状态），改统计真实存在的已汇总
+        summarized: countBy('SUMMARIZED'),
       }
     }
   } catch (e) {

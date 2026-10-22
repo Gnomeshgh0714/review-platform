@@ -41,11 +41,16 @@ def call(method, path, token=None, body=None, expect=200):
     )
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(resp.read().decode())
+            raw = resp.read().decode()
             status = resp.status
     except urllib.error.HTTPError as e:
-        data = json.loads(e.read().decode())
+        raw = e.read().decode()
         status = e.code
+    # V1.2 一般#15：DELETE 等成功响应可能带空 body（204 No Content），不可强制 JSON 解析
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        data = raw
     label = f'{method} {path} -> {status}'
     if status == expect:
         OK.append(label)
@@ -229,6 +234,31 @@ print('== 10. 作者侧可见性（通知+稿件列表）==')
 _, articles = call('GET', '/tasks/my_articles/', tok_author)
 assert any(a['task_id'] == task_id for a in articles['results']), '作者看不到自己稿件'
 print(f'   作者稿件数={articles["count"]}')
+
+print('== 11. 清理冒烟数据（V1.2 一般#15）==')
+# 此前每次冒烟都在库里留下完整链路数据（任务/分配/意见/报告/状态日志/
+# 通知/知识库条目），多轮运行后演示库被冒烟数据淹没。收尾清理：
+# 1) 知识库条目：产品语义为归档记录不可删（无删除端点），将本次决策自动
+#    归档生成的条目置 PERMANENTLY_EXCLUDED 隔离——不进入 APPROVED 检索，
+#    也不再出现在编辑部待审核队列；
+_, pending = call('GET', '/knowledge/pending_reviews/', tok_editor)
+ki_ids = [k['knowledge_id'] for k in pending.get('results', [])
+          if k.get('source_task_id') == task_id]
+for ki in ki_ids:
+    call('POST', f'/knowledge/{ki}/review/', tok_editor,
+         body={'decision': 'PERMANENTLY_EXCLUDED', 'notes': 'E2E 冒烟数据清理'},
+         expect=200)
+print(
+    f'   知识库条目隔离 {len(ki_ids)} 条（PERMANENTLY_EXCLUDED）'
+    if ki_ids else
+    # 同编号任务当日删尾复用时，历史隔离条目会触发 auto_anonymize 的
+    # 「已存在归档记录」幂等跳过，本次运行无新待审条目属预期行为
+    '   知识库条目隔离 0 条（同编号复用触发归档幂等跳过，无新待审条目）'
+)
+# 2) 任务删除（编辑部）：FK CASCADE 一并清理 assignments/opinions/form/
+#    summary_report/state_logs/notifications
+call('DELETE', f'/tasks/{task_id}/', tok_editor, expect=204)
+print(f'   任务 {task_id} 及关联数据已删除')
 
 print()
 print(f'通过 {len(OK)} 项')

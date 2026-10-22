@@ -71,14 +71,26 @@ class StateMachineService:
 
         elif target_state == 'PENDING' and current == 'REVIEWING':
             # REVIEWING->PENDING: 全部超时或编辑选择回退
-            accepted = task.assignments.filter(assignment_status__in=['ACCEPTED', 'OVERDUE'])
-            submitted = accepted.filter(assignment_status='SUBMITTED').count()
+            # V1.2 一般#19：原链式 accepted(SUBMITTED∈∅) 计数恒 0，
+            # 「已有审稿人提交」校验形同虚设；改为直接按 SUBMITTED 计数
+            submitted = task.assignments.filter(assignment_status='SUBMITTED').count()
             if submitted > 0 and not reason.startswith('编辑选择回退'):
                 raise StateMachineError(
                     '已有审稿人提交意见，回退需编辑明确选择"回退待分配，已提交意见保留为历史记录"'
                 )
 
         return True
+
+    @staticmethod
+    def _operator_type(operator_user):
+        """V1.2 一般#10：按操作人实际角色记录 operator_type——审稿人触发
+        的转换（接受邀请自动流转等）不再误记为 EDITOR；无操作人记 SYSTEM，
+        兼具编辑/审稿人双角色时记 EDITOR（以更高权限为准）。"""
+        if not operator_user:
+            return 'SYSTEM'
+        if not getattr(operator_user, 'is_editor', False) and getattr(operator_user, 'is_reviewer', False):
+            return 'REVIEWER'
+        return 'EDITOR'
 
     @staticmethod
     @transaction.atomic
@@ -103,7 +115,7 @@ class StateMachineService:
             task=task,
             from_state=old_state,
             to_state=target_state,
-            operator_type='EDITOR' if operator_user else 'SYSTEM',
+            operator_type=StateMachineService._operator_type(operator_user),
             operator_user=operator_user,
             trigger_reason=reason or VALID_TRANSITIONS.get((old_state, target_state), ''),
         )

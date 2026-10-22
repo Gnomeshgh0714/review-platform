@@ -140,8 +140,10 @@
           <h4>维度评分（匿名化）</h4>
           <el-table :data="currentDetail.anonymized_dimensions" border size="small" class="mb-16">
             <el-table-column prop="dimensionName" label="维度" width="140" />
-            <el-table-column prop="avg" label="均分" width="80" align="center">
-              <template #default="{ row }">{{ row.avg ?? '-' }}</template>
+            <!-- V1.2 一般#4：anonymized_dimensions 实际结构为 {dimensionName, scores:[{score,...}]}，
+                 无 avg 键，原读 row.avg 恒为 '-'，改为由 scores 现算均分 -->
+            <el-table-column label="均分" width="80" align="center">
+              <template #default="{ row }">{{ dimAvg(row) }}</template>
             </el-table-column>
           </el-table>
         </template>
@@ -185,6 +187,13 @@ const subjectOptions = [
 
 const recTagType = (key) => RECOMMENDATION[key]?.color || 'info'
 const recLabel = (key) => RECOMMENDATION[key]?.label || key
+
+// V1.2 一般#4：后端归档时未预计算 avg 字段，维度均分由 scores 数组现算
+const dimAvg = (row) => {
+  const scores = (row.scores || []).map(s => s.score).filter(s => typeof s === 'number')
+  if (!scores.length) return '-'
+  return (scores.reduce((a, b) => a + b, 0) / scores.length).toFixed(1)
+}
 
 const handleSearch = () => {
   page.value = 1

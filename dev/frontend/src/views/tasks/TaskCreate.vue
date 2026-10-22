@@ -237,7 +237,14 @@ const handleUpload = async (options) => {
     form.manuscript_file = res.file_path
     ElMessage.success('文件上传成功')
   } catch (e) {
-    ElMessage.error('上传失败')
+    // V1.2 一般#26：上传失败必须清理本地状态并 rethrow——否则 el-upload 显示假成功、
+    // limit=1 阻止重传，直到创建任务才暴露「请上传稿件PDF」；
+    // 具体 HTTP 错误提示已由 axios 拦截器统一弹出，此处不再重复弹笼统提示
+    uploadedFile.value = null
+    form.manuscript_file = ''
+    anonCheck.value = null
+    pdfMetadataAuthor.value = ''
+    throw e
   } finally {
     uploading.value = false
   }
@@ -273,10 +280,20 @@ onMounted(async () => {
     templates.value = res.results || res || []
   } catch (e) { /* ignore */ }
   // 作者账号列表（编辑部权限，客户端过滤 AUTHOR 角色）
+  // V1.2 一般#2：用户接口分页返回，原先只取第一页 20 条，作者超 20 人时
+  // 选择器静默丢人——翻页取全后再过滤
   try {
-    const res = await userApi.list()
-    const users = res.results || res || []
-    authors.value = users.filter(u => (u.roles || []).includes('AUTHOR'))
+    const all = []
+    let p = 1
+    for (;;) {
+      const res = await userApi.list({ page: p, page_size: 100 })
+      const users = res.results || res || []
+      all.push(...users)
+      const cnt = res.count ?? all.length
+      if (all.length >= cnt || users.length === 0) break
+      p += 1
+    }
+    authors.value = all.filter(u => (u.roles || []).includes('AUTHOR'))
   } catch (e) { /* ignore */ }
 })
 </script>

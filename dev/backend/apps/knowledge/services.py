@@ -9,6 +9,7 @@ import re
 import logging
 from datetime import timedelta
 from django.utils import timezone as tz
+from django.db import transaction
 from django.db.models import Q
 
 from .models import KnowledgeItem, AccessLog
@@ -81,7 +82,16 @@ class AnonymizationService:
         anonymized_dims = cls._build_anonymized_dimensions(task, report)
         anonymized_recs = cls._build_anonymized_recommendations(report)
         anonymized_summary = cls._build_anonymized_summary(task, report)
+        # V1.2 一般#11：待审核段此前只扫汇总文本，维度评语（scores[].comment）
+        # 中的敏感词漏检；增扫匿名化维度评语，合并入待审核段
         pending_segments = cls._scan_segments(anonymized_summary)
+        dim_comment_texts = []
+        for dim in (anonymized_dims if isinstance(anonymized_dims, list) else []):
+            if isinstance(dim, dict):
+                for s in dim.get('scores', []):
+                    if isinstance(s, dict) and s.get('comment'):
+                        dim_comment_texts.append(str(s['comment']))
+        pending_segments += cls._scan_segments('\n'.join(dim_comment_texts))
         tags = cls._generate_tags(task, report)
         keywords = cls._extract_keywords(task)
 
@@ -207,13 +217,20 @@ class AnonymizationService:
                         desc = cp.get('distributionText', cp.get('description', ''))
                         parts.append(f'  {dim_name}: {desc}')
 
-            # 一致点（analyze_consensus 输出键：dimensionName/dimensionId/description）
+            # 一致点（analyze_consensus 实际输出键：dimensionName/dimensionId/
+            # type/typeLabel/avgScore/maxScore/minScore/diff/scoreDistribution/
+            # distributionText）
+            # V1.2 一般#21：原渲染读不存在的 description 键，一致点详情恒为
+            # 空串；改按实际键渲染类型/均分/分布
             if report.consensus_points:
                 parts.append('【一致点】')
                 for cp in report.consensus_points:
                     if isinstance(cp, dict):
                         dim_name = cp.get('dimensionName', cp.get('dimensionId', ''))
-                        parts.append(f'  {dim_name}: {cp.get("description", "")}')
+                        parts.append(
+                            f'  {dim_name}: {cp.get("typeLabel", "")} '
+                            f'均分={cp.get("avgScore", "")} {cp.get("distributionText", "")}'
+                        )
 
             # 综合评语（匿名化：移除审稿人身份）
             if report.overall_comments:
@@ -289,7 +306,9 @@ class AnonymizationService:
         # 推荐意见标签
         if report and report.recommendation_distribution:
             for rec, count in report.recommendation_distribution.items():
-                if count > 0:
+                # V1.2 一般#20：recommendation_distribution 含 total 汇总键，
+                # 不应作为推荐标签混入自动标签
+                if rec != 'total' and count > 0:
                     tags.append(rec)
 
         # 评分区间标签（键名对齐：均值需从 scores[].score 现算，报告无 avg 键）
@@ -386,35 +405,39 @@ class KnowledgeService:
         :return: KnowledgeItem
         :raises ValueError: 条目不存在或状态不允许
         """
-        try:
-            item = KnowledgeItem.objects.get(knowledge_id=knowledge_id)
-        except KnowledgeItem.DoesNotExist:
-            raise ValueError(f'知识库条目 {knowledge_id} 不存在')
+        # V1.2 一般#9：并发审核（重复点击/双开页面）下 get→校验→save 存在竞态
+        #（如一方 APPROVED 后另一方仍按 PENDING_REVIEW 通过校验覆写不可逆
+        # 归档状态）；整体包事务并对条目行加锁，状态校验移到锁内
+        with transaction.atomic():
+            try:
+                item = KnowledgeItem.objects.select_for_update().get(knowledge_id=knowledge_id)
+            except KnowledgeItem.DoesNotExist:
+                raise ValueError(f'知识库条目 {knowledge_id} 不存在')
 
-        # 状态校验：只有 PENDING_REVIEW 和 REJECTED 状态可审核
-        allowed = [
-            KnowledgeItem.AnonymizationStatus.PENDING_REVIEW,
-            KnowledgeItem.AnonymizationStatus.REJECTED,
-        ]
-        if item.anonymization_status not in allowed:
-            raise ValueError(f'当前状态 {item.anonymization_status} 不允许审核操作')
+            # 状态校验：只有 PENDING_REVIEW 和 REJECTED 状态可审核
+            allowed = [
+                KnowledgeItem.AnonymizationStatus.PENDING_REVIEW,
+                KnowledgeItem.AnonymizationStatus.REJECTED,
+            ]
+            if item.anonymization_status not in allowed:
+                raise ValueError(f'当前状态 {item.anonymization_status} 不允许审核操作')
 
-        now = tz.now()
+            now = tz.now()
 
-        if decision == 'APPROVED':
-            item.anonymization_status = KnowledgeItem.AnonymizationStatus.APPROVED
-            item.archived_at = now  # 不可逆归档
-        elif decision == 'REJECTED':
-            item.anonymization_status = KnowledgeItem.AnonymizationStatus.REJECTED
-        elif decision == 'PERMANENTLY_EXCLUDED':
-            item.anonymization_status = KnowledgeItem.AnonymizationStatus.PERMANENTLY_EXCLUDED
-        else:
-            raise ValueError(f'无效的审核决策: {decision}')
+            if decision == 'APPROVED':
+                item.anonymization_status = KnowledgeItem.AnonymizationStatus.APPROVED
+                item.archived_at = now  # 不可逆归档
+            elif decision == 'REJECTED':
+                item.anonymization_status = KnowledgeItem.AnonymizationStatus.REJECTED
+            elif decision == 'PERMANENTLY_EXCLUDED':
+                item.anonymization_status = KnowledgeItem.AnonymizationStatus.PERMANENTLY_EXCLUDED
+            else:
+                raise ValueError(f'无效的审核决策: {decision}')
 
-        item.reviewed_by = reviewer
-        item.reviewed_at = now
-        item.review_notes = notes or ''  # 评审意见 V1.2 严重#5：审核备注落库
-        item.save()
+            item.reviewed_by = reviewer
+            item.reviewed_at = now
+            item.review_notes = notes or ''  # 评审意见 V1.2 严重#5：审核备注落库
+            item.save()
 
         logger.info(f'审核完成: ki={knowledge_id}, decision={decision}, reviewer={reviewer.email}')
         return item

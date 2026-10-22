@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from apps.users.models import User
 
 
@@ -51,12 +51,23 @@ class ReviewTask(models.Model):
     def save(self, *args, **kwargs):
         if not self.task_id:
             from django.utils import timezone as tz
+            # V1.2 一般#7：当日计数在并发下撞主键会 IntegrityError，改为
+            # 保存点+重试（同 forms.ReviewOpinion 模式），重试耗尽后兜底直写
             today = tz.now().strftime('%Y%m%d')
-            count = ReviewTask.objects.filter(
-                task_id__startswith=f'RT-{today}'
-            ).count()
-            self.task_id = f'RT-{today}-{count + 1:04d}'
-        super().save(*args, **kwargs)
+            for _ in range(6):
+                count = ReviewTask.objects.filter(
+                    task_id__startswith=f'RT-{today}'
+                ).count()
+                self.task_id = f'RT-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue
+            super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.task_id} - {self.title[:30]}'
@@ -112,12 +123,23 @@ class ReviewAssignment(models.Model):
     def save(self, *args, **kwargs):
         if not self.assignment_id:
             from django.utils import timezone as tz
+            # V1.2 一般#7：当日计数在并发下撞主键会 IntegrityError，改为
+            # 保存点+重试（同 forms.ReviewOpinion 模式），重试耗尽后兜底直写
             today = tz.now().strftime('%Y%m%d')
-            count = ReviewAssignment.objects.filter(
-                assignment_id__startswith=f'RA-{today}'
-            ).count()
-            self.assignment_id = f'RA-{today}-{count + 1:04d}'
-        super().save(*args, **kwargs)
+            for _ in range(6):
+                count = ReviewAssignment.objects.filter(
+                    assignment_id__startswith=f'RA-{today}'
+                ).count()
+                self.assignment_id = f'RA-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue
+            super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.assignment_id} - {self.task.task_id} - {self.reviewer.name}'
@@ -129,6 +151,11 @@ class StateLog(models.Model):
     class OperatorType(models.TextChoices):
         SYSTEM = 'SYSTEM', '系统'
         EDITOR = 'EDITOR', '编辑部'
+        # V1.2 一般#10：审稿人触发的转换（接受邀请自动流转等）此前被统一
+        # 记为 EDITOR，与实际操作人不符；新增 REVIEWER 枚举，写入方按
+        # operator_user 实际角色判定（见 state_machine.execute_transition）。
+        # 历史数据不迁移，展示层按 operator_user_id 归属判定不受影响
+        REVIEWER = 'REVIEWER', '审稿人'
 
     log_id = models.BigAutoField(primary_key=True)
     task = models.ForeignKey(
@@ -176,12 +203,23 @@ class Template(models.Model):
     def save(self, *args, **kwargs):
         if not self.template_id:
             from django.utils import timezone as tz
+            # V1.2 一般#7：当日计数在并发下撞主键会 IntegrityError，改为
+            # 保存点+重试（同 forms.ReviewOpinion 模式），重试耗尽后兜底直写
             today = tz.now().strftime('%Y%m%d')
-            count = Template.objects.filter(
-                template_id__startswith=f'TPL-{today}'
-            ).count()
-            self.template_id = f'TPL-{today}-{count + 1:04d}'
-        super().save(*args, **kwargs)
+            for _ in range(6):
+                count = Template.objects.filter(
+                    template_id__startswith=f'TPL-{today}'
+                ).count()
+                self.template_id = f'TPL-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue
+            super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
 
     def __str__(self):
         return f'{self.template_id} - {self.template_name}'

@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from apps.tasks.models import ReviewTask
 
 
@@ -22,7 +22,18 @@ class SummaryReport(models.Model):
     def save(self, *args, **kwargs):
         if not self.report_id:
             from django.utils import timezone as tz
+            # V1.2 一般#7：当日计数在并发下撞主键会 IntegrityError，改为
+            # 保存点+重试（同 forms.ReviewOpinion 模式），重试耗尽后兜底直写
             today = tz.now().strftime('%Y%m%d')
-            count = SummaryReport.objects.filter(report_id__startswith=f'SR-{today}').count()
-            self.report_id = f'SR-{today}-{count + 1:04d}'
-        super().save(*args, **kwargs)
+            for _ in range(6):
+                count = SummaryReport.objects.filter(report_id__startswith=f'SR-{today}').count()
+                self.report_id = f'SR-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue
+            super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)

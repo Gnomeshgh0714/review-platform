@@ -1,5 +1,22 @@
 from rest_framework import serializers
+from django.contrib.auth.password_validation import validate_password
+from django.core.exceptions import ValidationError as DjangoValidationError
 from .models import User
+
+
+def blacklist_user_tokens(user):
+    """V1.2 一般#22：将用户全部已签发 refresh token 加入黑名单（幂等），
+    改密/重置密码后旧 refresh 立即失效；access 为无状态 JWT，最长 12h
+    自然过期。供 change_password 与编辑部重置密码通道共用。"""
+    from rest_framework_simplejwt.exceptions import TokenError
+    from rest_framework_simplejwt.tokens import RefreshToken
+    from rest_framework_simplejwt.token_blacklist.models import OutstandingToken
+    for token in OutstandingToken.objects.filter(user=user):
+        try:
+            RefreshToken(token.token).blacklist()
+        except TokenError:
+            # 已过期/无法解析的 token 无需拉黑
+            continue
 
 
 class UserSerializer(serializers.ModelSerializer):
@@ -35,13 +52,26 @@ class UserAdminSerializer(serializers.ModelSerializer):
         model = User
         fields = ['name', 'email', 'roles', 'institution', 'research_areas', 'password']
 
+    def validate_password(self, value):
+        # V1.2 一般#32：编辑部重置密码通道接入 AUTH_PASSWORD_VALIDATORS
+        #（settings 已定义但此前未接线任何通道）
+        try:
+            validate_password(value, self.instance)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(list(e.messages))
+        return value
+
     def update(self, instance, validated_data):
         password = validated_data.pop('password', None)
         for attr, value in validated_data.items():
             setattr(instance, attr, value)
+        password_reset = bool(password)
         if password:
             instance.set_password(password)
         instance.save()
+        if password_reset:
+            # V1.2 一般#22：重置密码后旧 refresh token 一并拉黑
+            blacklist_user_tokens(instance)
         return instance
 
 
@@ -61,6 +91,15 @@ class UserCreateSerializer(serializers.ModelSerializer):
             'email': {'required': True},
             'roles': {'required': True},
         }
+
+    def validate_password(self, value):
+        # V1.2 一般#32：创建用户通道接入 AUTH_PASSWORD_VALIDATORS；
+        # 缺省默认密码不在此校验（见 create），但鼓励首次登录后修改
+        try:
+            validate_password(value)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(list(e.messages))
+        return value
 
     def create(self, validated_data):
         # 未传密码时设默认密码，保证账号可登录
@@ -84,6 +123,15 @@ class ChangePasswordSerializer(serializers.Serializer):
         user = self.context['request'].user
         if not user.check_password(value):
             raise serializers.ValidationError('旧密码错误')
+        return value
+
+    def validate_new_password(self, value):
+        # V1.2 一般#32：自助改密通道接入 AUTH_PASSWORD_VALIDATORS
+        #（含与用户属性相似度校验，需传 user 实例）
+        try:
+            validate_password(value, self.context['request'].user)
+        except DjangoValidationError as e:
+            raise serializers.ValidationError(list(e.messages))
         return value
 
 

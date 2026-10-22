@@ -74,10 +74,10 @@
       </el-table>
 
       <el-pagination
-        v-if="total > 20"
+        v-if="total > PAGE_SIZE"
         class="mt-16"
         :total="total"
-        :page-size="20"
+        :page-size="PAGE_SIZE"
         layout="total, prev, pager, next"
         v-model:current-page="page"
         @current-change="fetchList"
@@ -99,6 +99,10 @@ const loading = ref(false)
 const list = ref([])
 const total = ref(0)
 const page = ref(1)
+// V1.2 一般#5：当前筛选条件下的全量结果集——统一驱动列表分页、total 与统计卡片
+const filteredAll = ref([])
+
+const PAGE_SIZE = 20
 
 const filters = reactive({ keyword: '', status: '', subject: '' })
 
@@ -115,9 +119,11 @@ const statCards = [
 ]
 
 // 统计从看板数据现算（dashboard 端点返回任务列表而非统计对象）
+// V1.2 一般#5：统计基于当前筛选条件下的全量结果（filteredAll），与 total 同口径，
+// 不再只统计当前页，避免列表/total/统计三者描述不同集合
 const statusCounts = computed(() => {
   const counts = {}
-  for (const t of list.value) {
+  for (const t of filteredAll.value) {
     counts[t.status] = (counts[t.status] || 0) + 1
   }
   return counts
@@ -128,14 +134,16 @@ const submittedCount = (row) =>
 
 const isOverdue = (deadline, status) => {
   if (!deadline) return false
-  if (['DECIDED', 'ARCHIVED', 'REJECTED'].includes(status)) return false
+  // V1.2 一般#3：任务终态只有 DECIDED（ARCHIVED/REJECTED 为前端死键，已从词表删除）
+  if (status === 'DECIDED') return false
   return daysRemaining(deadline) < 0
 }
 
 const deadlineClass = (deadline, status) => {
   if (isOverdue(deadline, status)) return 'text-danger'
   const days = daysRemaining(deadline)
-  if (days !== null && days <= 3 && !['DECIDED', 'ARCHIVED'].includes(status)) return 'text-warning'
+  // V1.2 一般#3：终态判断去除 ARCHIVED 死键
+  if (days !== null && days <= 3 && status !== 'DECIDED') return 'text-warning'
   return ''
 }
 
@@ -144,21 +152,34 @@ const handleSearch = () => { page.value = 1; fetchList() }
 const fetchList = async () => {
   loading.value = true
   try {
-    // dashboard 端点支持 status/subject 服务端筛选；keyword 前端过滤
-    const params = { page: page.value }
+    // V1.2 一般#5：keyword 为前端过滤，原先只过滤当前页 20 条，导致列表/total/统计
+    // 三口径互相矛盾——改为按筛选条件翻页取全量后统一过滤，列表分页、total、
+    // 统计卡片全部基于同一结果集；status/subject 仍走服务端筛选减少传输
+    const params = { page_size: 100 }
     if (filters.status) params.status = filters.status
     if (filters.subject) params.subject = filters.subject
-    const res = await taskApi.dashboard(params)
-    let rows = res.results || res || []
+    const all = []
+    let p = 1
+    for (;;) {
+      const res = await taskApi.dashboard({ ...params, page: p })
+      const rows = res.results || res || []
+      all.push(...rows)
+      const cnt = res.count ?? all.length
+      if (all.length >= cnt || rows.length === 0) break
+      p += 1
+    }
     if (filters.keyword) {
       const kw = filters.keyword.toLowerCase()
-      rows = rows.filter(t =>
+      filteredAll.value = all.filter(t =>
         (t.title || '').toLowerCase().includes(kw) ||
         (t.task_id || '').toLowerCase().includes(kw),
       )
+    } else {
+      filteredAll.value = all
     }
-    list.value = rows
-    total.value = res.count || rows.length
+    // 客户端分页：列表展示当前页切片，total 为过滤后全量长度
+    list.value = filteredAll.value.slice((page.value - 1) * PAGE_SIZE, page.value * PAGE_SIZE)
+    total.value = filteredAll.value.length
   } catch (e) { console.error(e) } finally { loading.value = false }
 }
 

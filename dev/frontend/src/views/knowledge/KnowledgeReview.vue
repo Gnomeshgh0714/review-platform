@@ -138,8 +138,10 @@ const handleReview = async (item) => {
 }
 
 // 审核接口入参：{decision: APPROVED/REJECTED/PERMANENTLY_EXCLUDED, notes}
+// V1.2 一般#29：提交结果以布尔返回——接口失败时（拦截器已弹错）
+// 调用方不得再无条件弹成功提示，否则条目仍在待审队列却显示「已归档」造成漏审假象
 const submitReview = async (decision) => {
-  if (!currentItem.value) return
+  if (!currentItem.value) return false
   submitting.value = true
   try {
     await knowledgeApi.reviewAnonymization(currentItem.value.knowledge_id, {
@@ -148,7 +150,10 @@ const submitReview = async (decision) => {
     })
     reviewDialog.value = false
     fetchList()
-  } catch (e) { /* handled */ } finally {
+    return true
+  } catch (e) {
+    return false
+  } finally {
     submitting.value = false
   }
 }
@@ -163,8 +168,9 @@ const handleApprove = async () => {
   } catch {
     return
   }
-  await submitReview('APPROVED')
-  ElMessage.success('审核通过，已归档到知识库')
+  // V1.2 一般#29：仅在提交成功时提示
+  const ok = await submitReview('APPROVED')
+  if (ok) ElMessage.success('审核通过，已归档到知识库')
 }
 
 const handleReject = async () => {
@@ -172,8 +178,9 @@ const handleReject = async () => {
     ElMessage.warning('退回修改时需填写审核意见')
     return
   }
-  await submitReview('REJECTED')
-  ElMessage.success('已退回修改')
+  // V1.2 一般#29：仅在提交成功时提示
+  const ok = await submitReview('REJECTED')
+  if (ok) ElMessage.success('已退回修改')
 }
 
 const handleExclude = async () => {
@@ -186,8 +193,9 @@ const handleExclude = async () => {
   } catch {
     return
   }
-  await submitReview('PERMANENTLY_EXCLUDED')
-  ElMessage.success('已标记为永久不归档')
+  // V1.2 一般#29：仅在提交成功时提示
+  const ok = await submitReview('PERMANENTLY_EXCLUDED')
+  if (ok) ElMessage.success('已标记为永久不归档')
 }
 
 onMounted(fetchList)

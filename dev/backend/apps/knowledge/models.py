@@ -1,4 +1,4 @@
-from django.db import models
+from django.db import IntegrityError, models, transaction
 from apps.users.models import User
 from apps.summaries.models import SummaryReport
 
@@ -53,10 +53,21 @@ class KnowledgeItem(models.Model):
     def save(self, *args, **kwargs):
         if not self.knowledge_id:
             from django.utils import timezone as tz
+            # V1.2 一般#7：当日计数在并发下撞主键会 IntegrityError，改为
+            # 保存点+重试（同 forms.ReviewOpinion 模式），重试耗尽后兜底直写
             today = tz.now().strftime('%Y%m%d')
-            count = KnowledgeItem.objects.filter(knowledge_id__startswith=f'KI-{today}').count()
-            self.knowledge_id = f'KI-{today}-{count + 1:04d}'
-        super().save(*args, **kwargs)
+            for _ in range(6):
+                count = KnowledgeItem.objects.filter(knowledge_id__startswith=f'KI-{today}').count()
+                self.knowledge_id = f'KI-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue
+            super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
 
 
 class AccessLog(models.Model):

@@ -101,8 +101,19 @@ const fetchList = async () => {
 const fetchPendingTasks = async () => {
   try {
     // /tasks/ 列表不支持状态筛选，编辑部用 dashboard 端点按 SUBMITTED 过滤
-    const res = await taskApi.dashboard({ status: 'SUBMITTED' })
-    pendingTasks.value = res.results || res || []
+    // V1.2 一般#2：dashboard 分页返回，原先只取第一页 20 条，待汇总任务超出时
+    // 选择器静默丢失——翻页取全
+    const all = []
+    let p = 1
+    for (;;) {
+      const res = await taskApi.dashboard({ status: 'SUBMITTED', page: p, page_size: 100 })
+      const rows = res.results || res || []
+      all.push(...rows)
+      const cnt = res.count ?? all.length
+      if (all.length >= cnt || rows.length === 0) break
+      p += 1
+    }
+    pendingTasks.value = all
   } catch (e) { /* ignore */ }
 }
 
@@ -117,6 +128,9 @@ const handleGenerate = async () => {
     ElMessage.success('汇总报告生成成功')
     showGenerate.value = false
     fetchList()
+    // V1.2 一般#2：生成成功后刷新待汇总下拉——该任务已离开 SUBMITTED 状态，
+    // 原先不刷新导致下次打开对话框仍可选到已汇总任务
+    fetchPendingTasks()
     router.push(`/summaries/${selectedTask.value}`)
   } catch (e) {
     // 错误提示由 axios 拦截器统一处理

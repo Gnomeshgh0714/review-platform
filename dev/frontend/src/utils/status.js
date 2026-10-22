@@ -3,6 +3,9 @@
  */
 
 // 任务状态
+// V1.2 一般#3：删除 ARCHIVED/REJECTED 死键——后端任务状态机终态只有 DECIDED
+// （P1 词表对齐时漏掉任务状态表），残留死键曾使作者仪表盘 ARCHIVED 统计恒 0、
+// 看板终态判断引用不存在的状态
 export const TASK_STATUS = {
   PENDING: { label: '待分配', color: 'info', icon: 'Clock' },
   ASSIGNED: { label: '待接受', color: '', icon: 'User' },
@@ -10,8 +13,6 @@ export const TASK_STATUS = {
   SUBMITTED: { label: '待汇总', color: 'success', icon: 'CircleCheck' },
   SUMMARIZED: { label: '已汇总', color: '', icon: 'DataAnalysis' },
   DECIDED: { label: '已决策', color: 'success', icon: 'Select' },
-  ARCHIVED: { label: '已归档', color: 'info', icon: 'FolderOpened' },
-  REJECTED: { label: '已拒稿', color: 'danger', icon: 'CircleClose' },
 }
 
 // 审稿意见推荐（键值与后端 ReviewOpinion.Recommendation 对齐）

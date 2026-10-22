@@ -380,11 +380,24 @@ class ReviewTaskViewSet(viewsets.ModelViewSet):
             except ValueError:
                 pass  # 已存在归档记录（幂等）
             except Exception as e:
-                # 归档失败不阻断决策主流程
-                logger.warning(
+                # 归档失败不阻断决策主流程，但不能只静默吞掉
+                # V1.2 一般#25：升级 error 日志并通知编辑部人工补归档
+                #（PRD §5.3.1：归档缺失会导致该案例从知识库永久缺失）
+                logger.error(
                     '知识库归档失败(不阻断决策): task=%s, error=%s',
                     task.task_id, e,
                 )
+                try:
+                    NotificationService._notify_multiple(
+                        NotificationService._get_editor_users(),
+                        task,
+                        'REMIND',
+                        '知识库归档失败待人工处理',
+                        f'任务 {task.task_id} 终审决策已录入，但知识库自动归档失败，'
+                        f'请人工排查补归档。错误信息：{e}',
+                    )
+                except Exception as notify_err:
+                    logger.error('归档失败告警通知发送失败: %s', notify_err)
 
         return Response({
             'message': '终审决策已录入',
@@ -410,8 +423,14 @@ class ReviewTaskViewSet(viewsets.ModelViewSet):
 
         overdue_only = request.query_params.get('overdue', '') == 'true'
         if overdue_only:
-            qs = qs.filter(deadline__lt=timezone.now().date(),
-                           status__in=['PENDING', 'ASSIGNED', 'REVIEWING'])
+            # V1.2 一般#24：超时口径此前用任务期望完成日期（task.deadline），
+            # 与分配记录口径（assignments.deadline，process_scheduled 的
+            # _mark_overdue 同源）不一致；改按「已接受/审稿中且分配截止日
+            # 已过」判定，多分配 join 后去重
+            qs = qs.filter(
+                assignments__deadline__lt=timezone.now().date(),
+                assignments__assignment_status__in=['ACCEPTED', 'REVIEWING'],
+            ).distinct()
 
         # 排序
         sort = request.query_params.get('sort', '-created_at')

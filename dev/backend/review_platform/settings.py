@@ -31,7 +31,11 @@ _load_dotenv()
 # SECURITY WARNING: keep the secret key used in production secret!
 SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-k8$dbc2^z85lqoz1opjbxh4)bfowcq3ov+9^am0mf6j=@0hax_')
 
-DEBUG = os.environ.get('DJANGO_DEBUG', 'True') == 'True'
+# V1.2 一般#13：DEBUG 兜底由 True 改为 False（安全默认，防 .env 缺失时
+# 以调试模式对外服务）；本地开发经 .env / 环境变量显式设置
+# DJANGO_DEBUG=True（见 backend/.env.example）。manage.py test 强制
+# DEBUG=False，测试不受影响
+DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'
 
 ALLOWED_HOSTS = ['localhost', '127.0.0.1', '*']
 
@@ -137,7 +141,10 @@ REST_FRAMEWORK = {
     'DEFAULT_PERMISSION_CLASSES': (
         'rest_framework.permissions.IsAuthenticated',
     ),
-    'DEFAULT_PAGINATION_CLASS': 'rest_framework.pagination.PageNumberPagination',
+    # V1.2 一般#1：分页器支持 page_size 查询参数（上限 100），
+    # 前端已传的 page_size（通知 50 / 仪表盘 5）自此生效；
+    # 实现见 review_platform/pagination.py
+    'DEFAULT_PAGINATION_CLASS': 'review_platform.pagination.StandardPagination',
     'PAGE_SIZE': 20,
     # #016 安全项1：登录限流档位（防暴力破解）——仅登录视图局部引用（见
     # apps/users/throttling.py），未设全局 DEFAULT_THROTTLE_CLASSES，其他接口不受影响。

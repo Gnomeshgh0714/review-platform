@@ -12,8 +12,11 @@ from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.core.files.storage import default_storage
 
-import PyPDF2
-from PyPDF2 import PdfReader
+# V1.2 一般#17：PDF 解析从已停维护的 PyPDF2 迁至 PyMuPDF（fitz），
+# requirements.txt 同步移除 PyPDF2；仅用元数据读取，API 面极小
+# V1.2 一般#17：`import fitz` 在 PyMuPDF 1.24+ 已弃用，改用官方推荐的 pymupdf 模块名
+# （别名保持 fitz 命名空间调用不变，避免两处调用点改动）
+import pymupdf as fitz
 
 from apps.files.models import UploadedFile
 
@@ -91,19 +94,18 @@ class FileService:
         pdf_author = ''
         metadata_warning = False
         try:
-            with open(full_disk_path, 'rb') as f:
-                reader = PdfReader(f)
-                metadata = reader.metadata
-                if metadata:
-                    # PyPDF2元数据字段名通常为 /Author
-                    author = metadata.get('/Author') or metadata.get('/author') or ''
-                    if author:
-                        pdf_author = str(author).strip()
-                        # 作者字段非空 -> 触发双盲匿名化警告
-                        metadata_warning = True
-                        logger.info(
-                            f'PDF元数据含作者信息: file={original_name}, author={pdf_author}'
-                        )
+            # V1.2 一般#17：PyMuPDF 读取元数据（键为小写无斜杠，无元数据时
+            # 值为空串，与 PyPDF2 的 /Author 口径一致）
+            with fitz.open(full_disk_path) as doc:
+                metadata = doc.metadata or {}
+                author = (metadata.get('author') or '').strip()
+                if author:
+                    pdf_author = author
+                    # 作者字段非空 -> 触发双盲匿名化警告
+                    metadata_warning = True
+                    logger.info(
+                        f'PDF元数据含作者信息: file={original_name}, author={pdf_author}'
+                    )
         except Exception as e:
             # PDF元数据读取失败不应阻断上传流程，仅记录日志
             logger.warning(f'PDF元数据读取失败(不阻断上传): file={original_name}, error={e}')
@@ -219,21 +221,16 @@ class FileService:
         status = 'pass'
         detail = '未检测到作者元数据'
         try:
-            with open(file_path, 'rb') as f:
-                reader = PdfReader(f)
-                metadata = reader.metadata
-                if metadata:
-                    author = metadata.get('/Author') or metadata.get('/author') or ''
-                    if author:
-                        author = str(author).strip()
-                        status = 'warning'
-                        detail = f'PDF元数据中包含作者信息: "{author}"，双盲模式下建议清除'
-                    else:
-                        status = 'pass'
-                        detail = 'PDF元数据中未包含作者信息'
+            # V1.2 一般#17：PyMuPDF 读取元数据（键为小写无斜杠）
+            with fitz.open(file_path) as doc:
+                metadata = doc.metadata or {}
+                author = (metadata.get('author') or '').strip()
+                if author:
+                    status = 'warning'
+                    detail = f'PDF元数据中包含作者信息: "{author}"，双盲模式下建议清除'
                 else:
                     status = 'pass'
-                    detail = 'PDF无元数据'
+                    detail = 'PDF元数据中未包含作者信息'
         except Exception as e:
             status = 'warning'
             detail = f'PDF元数据读取失败: {e}（无法确认是否匿名化）'
@@ -294,6 +291,19 @@ class FileService:
 
         if not (is_owner or is_editor):
             raise PermissionDenied('无权删除此文件，仅上传人或编辑部可删除')
+
+        # ---------- V1.2 一般#23：任务引用检查 ----------
+        # ReviewTask.manuscript_file 存储同一相对路径；被任务引用的稿件一旦
+        # 删除，任务详情/审稿表单/下载链路全部断链，一律拒绝删除（含编辑部）
+        from apps.tasks.models import ReviewTask
+        referencing = list(
+            ReviewTask.objects.filter(manuscript_file=uploaded_file.file_path)
+            .values_list('task_id', flat=True)[:5]
+        )
+        if referencing:
+            raise ValueError(
+                f'文件已被审稿任务引用（如 {", ".join(referencing)}），不可删除'
+            )
 
         # ---------- 删除磁盘文件 ----------
         abs_path = os.path.join(settings.MEDIA_ROOT, uploaded_file.file_path)

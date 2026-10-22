@@ -8,6 +8,7 @@ from .models import User
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserAdminSerializer,
     UserProfileSerializer, ChangePasswordSerializer, LoginSerializer,
+    blacklist_user_tokens,
 )
 from .throttling import LoginMinuteThrottle, LoginDailyThrottle
 
@@ -110,7 +111,9 @@ class UserViewSet(viewsets.ModelViewSet):
         if user is None:
             try:
                 user_obj = User.objects.get(email=email)
-                if user_obj.check_password(password):
+                # V1.2 一般#14：兜底分支补 is_active 校验，与 ModelBackend
+                # 口径对齐——禁用账号即使密码正确也不可登录
+                if user_obj.check_password(password) and user_obj.is_active:
                     user = user_obj
             except User.DoesNotExist:
                 pass
@@ -148,6 +151,10 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer.is_valid(raise_exception=True)
         request.user.set_password(serializer.validated_data['new_password'])
         request.user.save(update_fields=['password', 'updated_at'])
+        # V1.2 一般#22：改密后拉黑该用户全部 refresh token，旧 refresh 立即
+        # 失效（防止会话被劫持后改密仍留后门）；access 为无状态 JWT，
+        # 最长 12h 自然过期
+        blacklist_user_tokens(request.user)
         return Response({'message': '密码已修改，请使用新密码重新登录'})
 
     # ==================== 编辑部检索 ====================

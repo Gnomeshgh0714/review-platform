@@ -213,6 +213,13 @@ class FileViewSet(viewsets.ModelViewSet):
                 {'error': str(e)},
                 status=status.HTTP_403_FORBIDDEN
             )
+        except ValueError as e:
+            # V1.2 一般#23：文件被审稿任务引用时删除被拒，返回 400
+            #（引用检查见 FileService.delete_file）
+            return Response(
+                {'error': str(e)},
+                status=status.HTTP_400_BAD_REQUEST
+            )
         return Response(
             {'message': '文件删除成功'},
             status=status.HTTP_200_OK

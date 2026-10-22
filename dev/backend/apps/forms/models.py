@@ -18,10 +18,21 @@ class ReviewForm(models.Model):
     def save(self, *args, **kwargs):
         if not self.form_id:
             from django.utils import timezone as tz
+            # V1.2 一般#7：当日计数在并发下撞主键会 IntegrityError，改为
+            # 保存点+重试（同本文件 ReviewOpinion 模式），重试耗尽后兜底直写
             today = tz.now().strftime('%Y%m%d')
-            count = ReviewForm.objects.filter(form_id__startswith=f'RF-{today}').count()
-            self.form_id = f'RF-{today}-{count + 1:04d}'
-        super().save(*args, **kwargs)
+            for _ in range(6):
+                count = ReviewForm.objects.filter(form_id__startswith=f'RF-{today}').count()
+                self.form_id = f'RF-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue
+            super().save(*args, **kwargs)
+        else:
+            super().save(*args, **kwargs)
 
 
 class ReviewOpinion(models.Model):

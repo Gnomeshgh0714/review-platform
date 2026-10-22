@@ -71,9 +71,15 @@ def make_report(task, reviewer):
             'scoreDistribution': {'5': 1, '3': 1},
             'distributionText': '1/2位评分5分，1/2位评分3分',
         }],
+        # V1.2 一般#21：键名对齐 summaries/services.analyze_consensus 真实产出
+        # （typeLabel/avgScore/distributionText），原夹具用不存在的 avg/description
+        # 键，导致渲染修复无法被本测试文件检验
         consensus_points=[{
             'dimensionId': 'D1', 'dimensionName': '研究意义',
-            'type': 'POSITIVE', 'avg': 4.5, 'description': '两位审稿人均认可研究意义',
+            'type': 'POSITIVE', 'typeLabel': '正向一致', 'avgScore': 4.5,
+            'maxScore': 5, 'minScore': 4, 'diff': 1,
+            'scoreDistribution': {'5': 1, '4': 1},
+            'distributionText': '1/2位评分5分，1/2位评分4分',
         }],
         revision_suggestions_summary={
             'by_dimension': {'D2': [{
@@ -194,6 +200,10 @@ class AutoAnonymizeTests(TestCase):
         self.assertIn('分歧点', summary)
         self.assertIn('1/2位评分5分，1/2位评分3分', summary)
         self.assertIn('一致点', summary)
+        # V1.2 一般#21：严格断言一致点详情渲染（typeLabel/avgScore/distributionText
+        # 为 analyze_consensus 实际键）——原只断言「一致点」章节标题，轮1渲染读错
+        # 键 description 输出空串时该测试依然绿灯，构成宽松断言假覆盖
+        self.assertIn('研究意义: 正向一致 均分=4.5 1/2位评分5分，1/2位评分4分', summary)
         # 综合评语按"审稿人A"口径，不带姓名
         self.assertIn('审稿人A: 整体扎实', summary)
 
