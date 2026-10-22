@@ -8,9 +8,18 @@ const api = axios.create({
   timeout: 30000,
 })
 
+// #018 杂项c：登出流程进行中标记——登出/会话过期时并发 401 只弹一次
+// 「登录已过期」toast（#016 场景C 观察到两条）。复位点在请求拦截器：
+// 发出新请求视为新一轮会话活动（含登录页提交——Login.vue 的 catch 依赖
+// 全局 toast 提示凭据错误，不能连错误密码的提示一起吞掉）；并发 401 的
+// 在途请求不会再经过拦截器，标记不会被同一批 401 自身复位。
+let loggingOut = false
+
 // 请求拦截器：自动附加 JWT
 api.interceptors.request.use(
   (config) => {
+    // #018 杂项c：新请求复位登出去重标记
+    loggingOut = false
     const token = localStorage.getItem('access_token')
     if (token) {
       config.headers.Authorization = `Bearer ${token}`
@@ -73,12 +82,17 @@ api.interceptors.response.use(
     if (response) {
       switch (response.status) {
         case 401:
-          ElMessage.error('登录已过期，请重新登录')
-          // 评审意见 V1.2 严重#11：只清 localStorage 不清 Pinia store 时，
-          // 路由守卫按 store 里的旧 token 判定「已登录」把登录页弹回
-          // Dashboard，会话过期陷入跳转死结——store 与 localStorage 一并重置
-          useAuthStore().logout()
-          router.push('/login')
+          // #018 杂项c：登出流程进行中（标记已置位且期间无新请求）的后续 401
+          // 不再重复弹 toast/登出/跳转，只保留首个（重复弹的 401 直接静默拒绝）
+          if (!loggingOut) {
+            loggingOut = true
+            ElMessage.error('登录已过期，请重新登录')
+            // 评审意见 V1.2 严重#11：只清 localStorage 不清 Pinia store 时，
+            // 路由守卫按 store 里的旧 token 判定「已登录」把登录页弹回
+            // Dashboard，会话过期陷入跳转死结——store 与 localStorage 一并重置
+            useAuthStore().logout()
+            router.push('/login')
+          }
           break
         case 403:
           ElMessage.error('没有权限执行此操作')

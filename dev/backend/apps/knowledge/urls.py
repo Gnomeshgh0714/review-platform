@@ -28,7 +28,8 @@ urlpatterns = [
     path('knowledge/export/', KnowledgeViewSet.as_view({'get': 'export'}),
          name='knowledge-export'),
     # 查看详情（记录访问日志）
-    path('knowledge/<str:knowledge_id>/detail/', KnowledgeViewSet.as_view({'get': 'detail'}),
+    # #018 修复1：方法名 detail 与 DRF 保留 initkwarg 冲突，改名 item_detail（URL 不变）
+    path('knowledge/<str:knowledge_id>/detail/', KnowledgeViewSet.as_view({'get': 'item_detail'}),
          name='knowledge-detail'),
     # 审核匿名化（仅编辑部）
     path('knowledge/<str:knowledge_id>/review/', KnowledgeViewSet.as_view({'post': 'review_anonymization'}),

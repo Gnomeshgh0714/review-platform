@@ -1,9 +1,15 @@
-"""汇总规则引擎测试 - 对应 AC-S-07（7条规则优先级匹配）与 N-01（Rule-4 重定义）"""
+"""汇总规则引擎测试 - 对应 AC-S-07（7条规则优先级匹配）与 N-01（Rule-4 重定义）
+
+尾部附带 #018 修复2 的 detail 端点 API 行为断言（编辑部可查、其他角色 403）。
+"""
 from datetime import date
+
+from rest_framework.test import APIClient
 
 from django.test import TestCase
 
 from apps.forms.models import ReviewForm, ReviewOpinion
+from apps.summaries.models import SummaryReport
 from apps.summaries.services import SummaryService
 from apps.tasks.models import ReviewTask, ReviewAssignment, Template, StateLog
 from apps.users.models import User
@@ -266,3 +272,73 @@ class GenerateReportTests(TestCase):
         from apps.tasks.state_machine import StateMachineError
         with self.assertRaises(StateMachineError):
             SummaryService.generate_report(self.task)
+
+
+class SummaryDetailEndpointApiTests(TestCase):
+    """#018 修复2：GET /api/summaries/<task_id>/detail/ 端点行为断言
+
+    原方法名 detail 与 DRF 3.18.3 ViewSetMixin.as_view() 的保留
+    initkwarg 冲突（URLconf 加载时 cls.detail = None 覆盖方法，
+    端点必 500）；#018 改名 detail_by_task（对外 URL 不变）后补齐
+    API 层覆盖：编辑部可查、其他角色 403、不存在 404。
+    """
+
+    def setUp(self):
+        self.editor = User.objects.create(
+            email='sum-editor@test.local', name='编辑部', roles=['EDITOR'],
+        )
+        self.reviewer = User.objects.create(
+            email='sum-reviewer@test.local', name='审稿人', roles=['REVIEWER'],
+        )
+        self.author = User.objects.create(
+            email='sum-author@test.local', name='作者', roles=['AUTHOR'],
+        )
+        self.client = APIClient()
+
+        template = Template.objects.create(
+            template_name='汇总详情测试模板', template_type='SYSTEM_DEFAULT',
+            dimensions=[{'dimensionId': 'D1', 'dimensionName': '研究意义'}],
+        )
+        self.task = ReviewTask.objects.create(
+            title='汇总详情测试稿件', abstract='摘要', keywords=['x'],
+            subject_area='经济学', manuscript_type='论文',
+            manuscript_file='sum-det.pdf', review_mode='SINGLE_BLIND',
+            deadline=date(2026, 12, 31), template_id=template.template_id,
+            author_user_id=self.author, status='SUMMARIZED',
+        )
+        self.report = SummaryReport.objects.create(
+            task=self.task,
+            recommendation_distribution={'ACCEPT': 1, 'total': 1},
+        )
+
+    def test_editor_reads_detail_by_task_id(self):
+        """编辑部通过 task_id 查汇总报告详情：200 且命中正确报告"""
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.get(f'/api/summaries/{self.task.task_id}/detail/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['report_id'], self.report.report_id)
+        self.assertEqual(
+            resp.data['recommendation_distribution']['total'], 1)
+
+    def test_editor_reads_detail_by_report_id(self):
+        """router 标准路由（GET /api/summaries/<report_id>/）同样可用：200"""
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.get(f'/api/summaries/{self.report.report_id}/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['report_id'], self.report.report_id)
+
+    def test_reviewer_forbidden(self):
+        self.client.force_authenticate(user=self.reviewer)
+        resp = self.client.get(f'/api/summaries/{self.task.task_id}/detail/')
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn('仅编辑部', str(resp.data))
+
+    def test_author_forbidden(self):
+        self.client.force_authenticate(user=self.author)
+        resp = self.client.get(f'/api/summaries/{self.task.task_id}/detail/')
+        self.assertEqual(resp.status_code, 403)
+
+    def test_missing_task_returns_404(self):
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.get('/api/summaries/RT-20990101-9999/detail/')
+        self.assertEqual(resp.status_code, 404)

@@ -23,7 +23,8 @@ urlpatterns = [
     path('summaries/match_rule_preview/', SummaryReportViewSet.as_view({'post': 'match_rule_preview'}),
          name='summary-match-rule-preview'),
     # 查看汇总报告详情（通过 task_id）
-    path('summaries/<str:task_id>/detail/', SummaryReportViewSet.as_view({'get': 'detail'}),
+    # #018 修复2：方法名 detail 与 DRF 保留 initkwarg 冲突，改名 detail_by_task（URL 不变）
+    path('summaries/<str:task_id>/detail/', SummaryReportViewSet.as_view({'get': 'detail_by_task'}),
          name='summary-detail-by-task'),
     # router标准路由：列表(GET summaries/) + 详情(GET summaries/<report_id>/)
     path('', include(router.urls)),

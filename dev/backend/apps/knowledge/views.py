@@ -80,8 +80,13 @@ class KnowledgeViewSet(viewsets.ViewSet):
 
     # ==================== 详情 ====================
 
+    # #018 修复1：DRF 3.18.3 的 ViewSetMixin.as_view() 会无条件执行
+    # cls.detail = None（detail 为保留 initkwarg），urls.py 任一次 as_view()
+    # 调用都会把名为 detail 的方法覆盖为 None，导致 GET
+    # /api/knowledge/<id>/detail/ 必 500（TypeError: NoneType not callable）。
+    # 方法改名 item_detail 规避保留字，url_path 保持原样 → 对外 URL 不变。
     @action(detail=False, methods=['get'], url_path=r'(?P<knowledge_id>[^/]+)/detail')
-    def detail(self, request, knowledge_id=None):
+    def item_detail(self, request, knowledge_id=None):
         """
         GET 查看知识库条目详情（记录访问日志）
 

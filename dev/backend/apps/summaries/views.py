@@ -3,7 +3,8 @@
 
 接口：
 - generate：POST 触发汇总报告生成（仅编辑部，任务需为SUBMITTED状态）
-- detail：GET 查看汇总报告详情（通过task_id查找）
+- detail_by_task：GET 查看汇总报告详情（通过task_id查找；对外 URL 仍为
+  summaries/<task_id>/detail/，#018 修复2：方法名 detail 与 DRF 保留字冲突改名）
 - list：GET 汇总报告列表（编辑部）
 - match_rule_preview：POST 预览规则匹配结果（不生成报告，仅返回匹配的规则，用于调试）
 """
@@ -74,7 +75,12 @@ class SummaryReportViewSet(viewsets.ViewSet):
 
     # ==================== 详情（通过 task_id，自定义路由） ====================
 
-    def detail(self, request, task_id=None):
+    # #018 修复2：同型缺陷——DRF 3.18.3 的 ViewSetMixin.as_view() 会执行
+    # cls.detail = None（detail 为保留 initkwarg），本类首个 as_view() 调用
+    # （urls.py 的 generate 路由）即把本方法覆盖为 None，随后经
+    # as_view({'get': 'detail'}) 路由的 GET /api/summaries/<task_id>/detail/
+    # 必 500。改名 detail_by_task 规避，URL 不变。
+    def detail_by_task(self, request, task_id=None):
         """GET 查看汇总报告详情（通过 task_id 查找）"""
         if not request.user.is_editor:
             return Response({'error': '仅编辑部可访问'}, status=403)

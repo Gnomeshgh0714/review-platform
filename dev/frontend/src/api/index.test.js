@@ -170,6 +170,45 @@ describe('#016 安全项3：401 单飞静默刷新重放', () => {
   })
 })
 
+describe('#018 杂项c：登出时并发 401 toast 去重', () => {
+  it('无 refresh_token 时两个并发 401 只弹一次「登录已过期」toast、只跳转一次', async () => {
+    localStorage.removeItem('refresh_token')
+    routeScripts.set('/tasks/a/', [{ status: 401, data: {} }])
+    routeScripts.set('/tasks/b/', [{ status: 401, data: {} }])
+
+    const results = await Promise.allSettled([
+      api.get('/tasks/a/'),
+      api.get('/tasks/b/'),
+    ])
+    results.forEach((r) => expect(r.status).toBe('rejected'))
+
+    // #016 场景C：登出时并发 401 曾弹两条 toast，去重后只保留首个
+    expect(elMessageError).toHaveBeenCalledTimes(1)
+    expect(elMessageError).toHaveBeenCalledWith('登录已过期，请重新登录')
+    expect(routerPush).toHaveBeenCalledTimes(1)
+    expect(routerPush).toHaveBeenCalledWith('/login')
+    // 登出态已落定：store 与 localStorage 一并重置
+    const store = useAuthStore()
+    expect(store.token).toBe('')
+    expect(localStorage.getItem('access_token')).toBeNull()
+  })
+
+  it('去重后发出新请求再遇 401 会重新提示（请求拦截器复位标记）', async () => {
+    localStorage.removeItem('refresh_token')
+    routeScripts.set('/tasks/a/', [{ status: 401, data: {} }])
+    await expect(api.get('/tasks/a/')).rejects.toMatchObject({ response: { status: 401 } })
+    expect(elMessageError).toHaveBeenCalledTimes(1)
+
+    // 新请求（如登录页提交）复位去重标记：再次 401 照常弹 toast，
+    // 保障 Login.vue catch 依赖全局 toast 的凭据错误反馈不被吞掉
+    routeScripts.set('/tasks/b/', [{ status: 401, data: {} }])
+    await expect(api.get('/tasks/b/')).rejects.toMatchObject({ response: { status: 401 } })
+    expect(elMessageError).toHaveBeenCalledTimes(2)
+    expect(elMessageError).toHaveBeenLastCalledWith('登录已过期，请重新登录')
+    expect(routerPush).toHaveBeenCalledTimes(2)
+  })
+})
+
 describe('#015 遗留2：silent404 请求标记', () => {
   it('带 silent404: true 的 404 静默拒绝，不弹全局 toast（my_opinion 空态场景）', async () => {
     routeScripts.set('/opinions/my_opinion/', [{ status: 404, data: { detail: '未找到' } }])

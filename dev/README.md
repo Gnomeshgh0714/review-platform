@@ -97,15 +97,15 @@ cron 接法（示例：每 30 分钟一次）：
 
 ```bash
 cd backend
-python manage.py test apps    # 36 个单元/并发测试（含 AC-T-14 三人并发提交）
+python manage.py test apps    # 184 项单元/并发测试（含 AC-T-14 三人并发提交；#018 时点口径）
 ```
 
 全链路冒烟（需后端已启动、演示账号已就位）：`python scripts/e2e_smoke.py`，
 覆盖 建任务→分配→接受→三人提交→自动转 SUBMITTED→Rule-7 汇总→终审→状态日志链 全流程（22 项断言，任一失败退出码非 0）。
 加 `--frontend` 可先做经前端构建产物的冒烟（决策 #014 挂账项）：自动 `npx vite build`
-产出 dist 后起本地静态服务，断言入口 HTML 及其引用的 JS/CSS 资源可达（5 项断言），再跑上述 API 全链路。
+产出 dist 后起本地静态服务，断言入口 HTML 及其引用的 JS/CSS 资源可达（5 项断言），再跑上述 API 全链路（合计 27 项）。
 
-前端单元测试：`cd frontend && npm run test`（Vitest + happy-dom，覆盖 api 层 401 刷新重放/silent404 拦截器与 OpinionView 角色分流）。
+前端单元测试：`cd frontend && npm run test`（Vitest + happy-dom，16 项，覆盖 api 层 401 刷新重放/silent404 拦截器/登出并发 401 toast 去重（#018）与 OpinionView 角色分流）。
 
 ## 已知限制与待办
 

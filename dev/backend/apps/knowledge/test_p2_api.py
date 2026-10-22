@@ -2,9 +2,11 @@
 
 覆盖 apps/knowledge 五个端点的权限（编辑部 vs 审稿人 vs 作者）与行为断言：
 - GET  /api/knowledge/search/             检索（审稿人+编辑部；纯作者 403；仅 APPROVED 入结果）
-- GET  /api/knowledge/<id>/detail/        详情（端点当前必 500：DRF 3.18.3 保留字
-                                          detail 冲突，见 KnowledgeDetailEndpoint-
-                                          RegressionTests；行为口径在服务层钉死）
+- GET  /api/knowledge/<id>/detail/        详情（#018 修复1：DRF 3.18.3 保留字
+                                          detail 冲突已修——action 改名
+                                          item_detail 而 URL 不变；行为断言见
+                                          KnowledgeDetailApiTests，服务层口径
+                                          见 KnowledgeGetDetailServiceTests）
 - GET  /api/knowledge/pending_reviews/    待审核列表（仅编辑部）
 - POST /api/knowledge/<id>/review/        审核匿名化（仅编辑部；review_notes 真实落库，P2 严重#5）
 - GET  /api/knowledge/export/             导出（仅编辑部；不含 source_task_id）
@@ -232,42 +234,71 @@ class KnowledgeSearchBehaviorTests(TestCase):
             )
 
 
-class KnowledgeDetailEndpointRegressionTests(TestCase):
-    """#017 发现的产品代码 bug 现状锁定（只记录，不改产品代码）
+class KnowledgeDetailApiTests(TestCase):
+    """#018 修复1：detail 端点正常行为断言（替换原 500 现状锁定测试）
 
-    现象：GET /api/knowledge/<id>/detail/ 必 500（TypeError: 'NoneType'
-    object is not callable）。
-
-    根因：DRF 3.18.3 的 ViewSetMixin.as_view() 会执行 cls.detail = None
-    （detail 成为保留 initkwarg，用于 introspecting）。而
-    KnowledgeViewSet 恰好定义了名为 detail 的 @action 方法——urls.py
-    模块加载时任一次 KnowledgeViewSet.as_view(...) 调用都会把该类属性
-    覆盖为 None，后续请求 dispatch 时 getattr(self, 'detail') 得到
-    None，handler 调用即抛 TypeError。
-
-    影响：知识库详情端点在生产环境 100% 不可用；基线 91 项测试全过
-    是因为该端点零覆盖。同型问题：apps/summaries/views.py 的 detail
-    方法（GET /api/summaries/<task_id>/detail/，见本次报告）。
-
-    修复方向（待排期，不在本批测试补课范围内）：将 action 方法改名
-    （如 item_detail）并同步 urls.py 映射；修复后应把本类替换为
-    KnowledgeDetailApiTests 的正常行为断言（审稿人仅 APPROVED、
-    编辑部任意状态、404 隐藏等，见下方服务层测试已钉死的口径）。
+    原因：原方法名 detail 与 DRF 3.18.3 ViewSetMixin.as_view() 的保留
+    initkwarg 冲突（URLconf 加载时 cls.detail = None 覆盖方法），
+    GET /api/knowledge/<id>/detail/ 必 500；#018 将 action 改名
+    item_detail（url_path 不变 → 对外 URL 不变）后，端点行为对齐
+    KnowledgeGetDetailServiceTests 已钉死的服务层口径：
+    审稿人仅 APPROVED、编辑部任意状态、404 隐藏存在性、纯作者 403。
     """
 
     def setUp(self):
         self.editor = make_user('kb-editor@test.local', ['EDITOR'], '编辑部')
-        self.client = APIClient(raise_request_exception=False)
+        self.reviewer = make_user('kb-reviewer@test.local', ['REVIEWER'], '审稿人')
+        self.author = make_user('kb-author@test.local', ['AUTHOR'], '作者')
+        self.client = APIClient()
 
-    def test_detail_endpoint_currently_500_due_to_dr318_reserved_word(self):
-        item = make_knowledge_item('RT-DET-00', status='APPROVED')
+    def test_editor_reads_approved_detail(self):
+        item = make_knowledge_item('RT-DET-10', status='APPROVED')
         self.client.force_authenticate(user=self.editor)
         resp = self.client.get(f'/api/knowledge/{item.knowledge_id}/detail/')
-        self.assertEqual(
-            resp.status_code, 500,
-            '若此项失败且返回 200，说明 detail 端点已修复：请把本类替换为'
-            '正常行为断言（审稿人仅 APPROVED / 编辑部任意状态 / 404 隐藏）',
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['knowledge_id'], item.knowledge_id)
+        self.assertEqual(resp.data['anonymization_status'], 'APPROVED')
+
+    def test_reviewer_reads_approved_detail_and_writes_access_log(self):
+        """审稿人查 APPROVED 详情：200 且落 VIEW_KB_ITEM 访问日志"""
+        item = make_knowledge_item('RT-DET-11', status='APPROVED')
+        self.client.force_authenticate(user=self.reviewer)
+        resp = self.client.get(f'/api/knowledge/{item.knowledge_id}/detail/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['knowledge_id'], item.knowledge_id)
+        self.assertTrue(
+            AccessLog.objects.filter(
+                user=self.reviewer, action='VIEW_KB_ITEM',
+                target_id=item.knowledge_id,
+            ).exists()
         )
+
+    def test_editor_reads_non_approved_detail(self):
+        """编辑部可查任意状态（待审核条目详情 200）"""
+        item = make_knowledge_item('RT-DET-12', status='PENDING_REVIEW')
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.get(f'/api/knowledge/{item.knowledge_id}/detail/')
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data['anonymization_status'], 'PENDING_REVIEW')
+
+    def test_reviewer_cannot_read_non_approved_hidden_as_404(self):
+        """非 APPROVED 对审稿人 404 隐藏存在性（服务层 ValueError → 端点 404）"""
+        item = make_knowledge_item('RT-DET-13', status='PENDING_REVIEW')
+        self.client.force_authenticate(user=self.reviewer)
+        resp = self.client.get(f'/api/knowledge/{item.knowledge_id}/detail/')
+        self.assertEqual(resp.status_code, 404)
+
+    def test_pure_author_forbidden(self):
+        item = make_knowledge_item('RT-DET-14', status='APPROVED')
+        self.client.force_authenticate(user=self.author)
+        resp = self.client.get(f'/api/knowledge/{item.knowledge_id}/detail/')
+        self.assertEqual(resp.status_code, 403)
+        self.assertIn('作者无权', str(resp.data))
+
+    def test_missing_item_returns_404(self):
+        self.client.force_authenticate(user=self.editor)
+        resp = self.client.get('/api/knowledge/KI-20990101-9999/detail/')
+        self.assertEqual(resp.status_code, 404)
 
 
 class KnowledgeGetDetailServiceTests(TestCase):
