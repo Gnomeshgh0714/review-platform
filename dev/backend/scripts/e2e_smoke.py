@@ -1,14 +1,35 @@
 """审稿协作平台全链路冒烟测试
 
-流程：编辑部建任务 -> 分配3位审稿人 -> 接受邀请 -> 各自提交意见
+默认路径（纯 API 直连）：编辑部建任务 -> 分配3位审稿人 -> 接受邀请 -> 各自提交意见
      -> 自动转SUBMITTED -> 生成汇总报告 -> 录入终审决策 -> 验证状态日志与通知
+
+可选路径（--frontend，决策 #014 挂账项）：在 API 冒烟前先做「经前端构建产物」的
+冒烟——npx vite build 产出 dist 后起本地静态服务，断言入口 HTML 与其引用的
+JS/CSS 资源均可达。范围是构建产物完整性，不含浏览器渲染级验证。
+不带开关时与本脚本既往行为完全一致。
 """
+import argparse
+import functools
+import http.server
 import json
+import re
+import socket
+import subprocess
+import threading
+import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 BASE = 'http://127.0.0.1:8000/api'
+FRONTEND_DIR = Path(__file__).resolve().parents[2] / 'frontend'
+DIST_DIR = FRONTEND_DIR / 'dist'
 OK, FAIL = [], []
+
+parser = argparse.ArgumentParser(description='审稿协作平台全链路冒烟测试')
+parser.add_argument('--frontend', action='store_true',
+                    help='先做前端构建产物冒烟（vite build + 静态服务断言），再跑 API 全链路')
+ARGS = parser.parse_args()
 
 
 def call(method, path, token=None, body=None, expect=200):
@@ -37,6 +58,80 @@ def login(email):
     _, data = call('POST', '/users/login/', body={'email': email, 'password': 'Demo@2026'})
     return data['access'], data['user']
 
+
+# ============ 可选：经前端构建产物的冒烟路径（--frontend，决策 #014 挂账项） ============
+
+class _QuietHandler(http.server.SimpleHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+
+def _record(ok, label, detail=''):
+    if ok:
+        OK.append(label)
+    elif detail:
+        FAIL.append(f'{label}: {detail}')
+    else:
+        FAIL.append(label)
+    print(f'   {"PASS" if ok else "FAIL"}  {label}')
+
+
+def _free_port():
+    with socket.socket() as s:
+        s.bind(('127.0.0.1', 0))
+        return s.getsockname()[1]
+
+
+def _http_get(url):
+    with urllib.request.urlopen(url, timeout=15) as resp:
+        return resp.status, resp.read().decode('utf-8', 'replace')
+
+
+def frontend_smoke():
+    """构建产物完整性这一档：可构建、入口可达、引用资源均 200。"""
+    print('== 0. 前端构建产物冒烟（--frontend）==')
+    # 0-1 构建可产出 dist（复用前端工程自身的 vite build，不额外接构建逻辑）
+    build = subprocess.run(['npx', 'vite', 'build'], cwd=FRONTEND_DIR,
+                           capture_output=True, text=True)
+    _record(build.returncode == 0, 'vite build 产出 dist',
+            (build.stderr or build.stdout).strip().splitlines()[-1] if build.returncode else '')
+    if build.returncode != 0:
+        return
+    # 0-2 入口与资源文件存在
+    index = DIST_DIR / 'index.html'
+    _record(index.is_file(), 'dist/index.html 存在')
+    assets_dir = DIST_DIR / 'assets'
+    assets = sorted(assets_dir.glob('*')) if assets_dir.is_dir() else []
+    _record(any(a.suffix == '.js' for a in assets) and any(a.suffix == '.css' for a in assets),
+            f'dist/assets 含 JS 与 CSS（共 {len(assets)} 个文件）')
+    if not index.is_file():
+        return
+    # 0-3 入口 HTML 可达且引用的 JS/CSS 资源全部 200（用 Python 标准库静态服务）
+    port = _free_port()
+    handler = functools.partial(_QuietHandler, directory=str(DIST_DIR))
+    httpd = http.server.ThreadingHTTPServer(('127.0.0.1', port), handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        status, html = _http_get(f'http://127.0.0.1:{port}/')
+        _record(status == 200 and 'id="app"' in html, 'GET / 返回入口 index.html')
+        refs = re.findall(r'(?:src|href)="(/assets/[^"]+?\.(?:js|css))"', html)
+        missing = []
+        for ref in refs:
+            try:
+                st, body = _http_get(f'http://127.0.0.1:{port}{ref}')
+                if st != 200 or not body:
+                    missing.append(ref)
+            except Exception as e:  # noqa: BLE001
+                missing.append(f'{ref} ({e})')
+        _record(bool(refs) and not missing,
+                f'入口引用的 JS/CSS 资源全部可达（{len(refs)} 个）', '; '.join(missing))
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
+if ARGS.frontend:
+    frontend_smoke()
 
 print('== 1. 登录三类角色 ==')
 tok_editor, editor = login('editor@review.local')
