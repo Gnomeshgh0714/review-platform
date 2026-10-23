@@ -65,6 +65,10 @@ class KnowledgeItem(models.Model):
                     return
                 except IntegrityError:
                     continue
+            # V1.3 G1：重试耗尽后按最新计数重算一次再直写（原实现带着
+            # 已撞号的 ID 直插必再失败）；仍冲突则抛出由调用方处理
+            count = KnowledgeItem.objects.filter(knowledge_id__startswith=f'KI-{today}').count()
+            self.knowledge_id = f'KI-{today}-{count + 1:04d}'
             super().save(*args, **kwargs)
         else:
             super().save(*args, **kwargs)

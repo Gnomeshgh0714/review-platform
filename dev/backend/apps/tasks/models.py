@@ -65,6 +65,12 @@ class ReviewTask(models.Model):
                     return
                 except IntegrityError:
                     continue
+            # V1.3 G1：重试耗尽后按最新计数重算一次再直写（原实现带着
+            # 已撞号的 ID 直插必再失败）；仍冲突则抛出由调用方处理
+            count = ReviewTask.objects.filter(
+                task_id__startswith=f'RT-{today}'
+            ).count()
+            self.task_id = f'RT-{today}-{count + 1:04d}'
             super().save(*args, **kwargs)
         else:
             super().save(*args, **kwargs)
@@ -137,6 +143,12 @@ class ReviewAssignment(models.Model):
                     return
                 except IntegrityError:
                     continue
+            # V1.3 G1：重试耗尽后按最新计数重算一次再直写（原实现带着
+            # 已撞号的 ID 直插必再失败）；仍冲突则抛出由调用方处理
+            count = ReviewAssignment.objects.filter(
+                assignment_id__startswith=f'RA-{today}'
+            ).count()
+            self.assignment_id = f'RA-{today}-{count + 1:04d}'
             super().save(*args, **kwargs)
         else:
             super().save(*args, **kwargs)
@@ -217,6 +229,12 @@ class Template(models.Model):
                     return
                 except IntegrityError:
                     continue
+            # V1.3 G1：重试耗尽后按最新计数重算一次再直写（原实现带着
+            # 已撞号的 ID 直插必再失败）；仍冲突则抛出由调用方处理
+            count = Template.objects.filter(
+                template_id__startswith=f'TPL-{today}'
+            ).count()
+            self.template_id = f'TPL-{today}-{count + 1:04d}'
             super().save(*args, **kwargs)
         else:
             super().save(*args, **kwargs)

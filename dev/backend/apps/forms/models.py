@@ -30,6 +30,10 @@ class ReviewForm(models.Model):
                     return
                 except IntegrityError:
                     continue
+            # V1.3 G1：重试耗尽后按最新计数重算一次再直写（原实现带着
+            # 已撞号的 ID 直插必再失败）；仍冲突则抛出由调用方处理
+            count = ReviewForm.objects.filter(form_id__startswith=f'RF-{today}').count()
+            self.form_id = f'RF-{today}-{count + 1:04d}'
             super().save(*args, **kwargs)
         else:
             super().save(*args, **kwargs)
@@ -93,5 +97,10 @@ class ReviewOpinion(models.Model):
                     return
                 except IntegrityError:
                     continue  # 他方已提交同号主键：重新计数再试
-            # 多次重试仍冲突（极端并发），最后一次直接抛出由调用方处理
+            # V1.3 G1：重试耗尽后按最新计数重算一次再直写（原「直接抛出」
+            # 前未重算，带撞号 ID 直插必再失败）；仍冲突则抛出由调用方处理
+            count = ReviewOpinion.objects.filter(
+                opinion_id__startswith=f'RO-{today}'
+            ).count()
+            self.opinion_id = f'RO-{today}-{count + 1:04d}'
         super().save(*args, **kwargs)
