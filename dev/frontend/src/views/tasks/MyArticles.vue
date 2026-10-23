@@ -122,6 +122,9 @@ const router = useRouter()
 // ============ 状态 ============
 const loading = ref(false)
 const articles = ref([])
+// V1.2 建议#9：my_articles 端点不消费 page/page_size（全量返回），
+// 此前翻页控件点击后仍渲染全量列表（假分页）；改为客户端切片分页
+const allArticles = ref([])
 const currentPage = ref(1)
 const pageSize = ref(20)
 const total = ref(0)
@@ -134,8 +137,15 @@ const fetchArticles = async () => {
       page: currentPage.value,
       page_size: pageSize.value,
     })
-    articles.value = res.results || res || []
-    total.value = res.count || articles.value.length
+    allArticles.value = res.results || res || []
+    total.value = allArticles.value.length
+    if (currentPage.value > 1 && (currentPage.value - 1) * pageSize.value >= total.value) {
+      currentPage.value = 1
+    }
+    articles.value = allArticles.value.slice(
+      (currentPage.value - 1) * pageSize.value,
+      currentPage.value * pageSize.value,
+    )
   } catch (e) {
     console.error('获取稿件列表失败:', e)
   } finally {

@@ -103,23 +103,36 @@ class FileService:
                     pdf_author = author
                     # 作者字段非空 -> 触发双盲匿名化警告
                     metadata_warning = True
+                    # V1.2 建议#4：作者真实姓名属双盲保护对象，不写入日志
+                    # （字段值仅入库，供授权用户经 check_metadata 查看）
                     logger.info(
-                        f'PDF元数据含作者信息: file={original_name}, author={pdf_author}'
+                        f'PDF元数据含作者信息(双盲风险): file={original_name}'
                     )
         except Exception as e:
             # PDF元数据读取失败不应阻断上传流程，仅记录日志
             logger.warning(f'PDF元数据读取失败(不阻断上传): file={original_name}, error={e}')
 
         # ---------- 5. 创建数据库记录 ----------
-        uploaded_file = UploadedFile.objects.create(
-            original_name=original_name,
-            file_path=relative_path,
-            file_size=file_size,
-            file_type='PDF',
-            uploaded_by=user,
-            pdf_metadata_author=pdf_author,
-            metadata_warning=metadata_warning,
-        )
+        # V1.2 建议#3：先写盘后建库的失败场景会残留孤儿文件（磁盘有文件、
+        # 库无记录，既不可下载也无人清理）；建库失败时回滚删除已落盘文件
+        try:
+            uploaded_file = UploadedFile.objects.create(
+                original_name=original_name,
+                file_path=relative_path,
+                file_size=file_size,
+                file_type='PDF',
+                uploaded_by=user,
+                pdf_metadata_author=pdf_author,
+                metadata_warning=metadata_warning,
+            )
+        except Exception:
+            try:
+                os.remove(full_disk_path)
+            except OSError as cleanup_err:
+                logger.warning(
+                    f'孤儿文件清理失败: path={full_disk_path}, error={cleanup_err}'
+                )
+            raise
 
         logger.info(
             f'文件上传成功: id={uploaded_file.file_id}, name={original_name}, '

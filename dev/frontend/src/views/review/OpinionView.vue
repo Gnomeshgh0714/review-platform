@@ -107,7 +107,10 @@ const formatDimensionScores = (opinion) => {
   const items = opinion.dimension_scores_detail || opinion.dimension_scores || []
   return items.map(item => ({
     code: item.dimensionId,
-    name: item.dimensionName || item.dimensionId,
+    // V1.2 建议#10：维度名缺失时回退展示机器代码（如 D1）可读性差，
+    // 改为「维度 1」序号展示
+    name: item.dimensionName
+      || (item.dimensionId ? `维度 ${String(item.dimensionId).replace(/^D/i, '')}` : '未命名维度'),
     score: item.score,
     comment: item.comment || '-',
   }))

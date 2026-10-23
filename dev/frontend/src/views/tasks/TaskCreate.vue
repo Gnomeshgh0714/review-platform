@@ -130,7 +130,7 @@
             placeholder="选择截止日期"
             format="YYYY-MM-DD"
             value-format="YYYY-MM-DD"
-            :disabled-date="(d) => d < new Date()"
+            :disabled-date="disabledPastDate"
           />
         </el-form-item>
 
@@ -176,6 +176,11 @@ const subjectOptions = [
   '经济学', '金融学', '管理学', '气候经济学', '环境经济学',
   '劳动经济学', '宏观经济学', '发展经济学', '应用计量', '政策评估',
 ]
+
+// V1.2 建议#19：禁选今天之前的日期（今天可选），与 TaskAssign 统一
+// 口径——此前本页禁选当天、TaskAssign 允许选到昨天，相邻页面同一
+// 语义字段行为相反
+const disabledPastDate = (d) => d.getTime() < new Date().setHours(0, 0, 0, 0)
 
 // 字段名与 ReviewTaskCreateSerializer 对齐
 const form = reactive({

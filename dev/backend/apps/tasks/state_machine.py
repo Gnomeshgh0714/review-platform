@@ -205,7 +205,11 @@ class StateMachineService:
         task.retry_count += 1
         task.save()
 
-        if task.retry_count > 3:
+        # V1.2 建议#14：此前条件为 > 3，超过 3 次后每次递增都向全体编辑部
+        # 重复发送「分配困难」通知；改为仅在首次超过 3 次（第 4 次）时发送
+        # 一次。下游取数仍以 retry_count > 3 作为「分配困难」判定（不再另加
+        # 显式标记字段，避免无消费方的迁移）
+        if task.retry_count == 4:
             from apps.notifications.services import NotificationService
             NotificationService.notify_editor_in_chief(
                 task=task,

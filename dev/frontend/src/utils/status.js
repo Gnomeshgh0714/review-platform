@@ -41,10 +41,20 @@ export const ASSIGNMENT_STATUS = {
   OVERDUE: { label: '已超时', color: 'danger' },
 }
 
+// V1.2 建议#8：纯日期串（YYYY-MM-DD）被 JS 按 UTC 午夜解析，东八区
+// 渲染成「08:00」且剩余天数偏移 8 小时；统一改按本地午夜解析
+const parseDate = (value) => {
+  if (typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value)) {
+    const [y, m, d] = value.split('-').map(Number)
+    return new Date(y, m - 1, d)
+  }
+  return new Date(value)
+}
+
 // 格式化日期
 export const formatDate = (date, format = 'YYYY-MM-DD HH:mm') => {
   if (!date) return '-'
-  return new Date(date).toLocaleString('zh-CN', {
+  return parseDate(date).toLocaleString('zh-CN', {
     year: 'numeric', month: '2-digit', day: '2-digit',
     hour: '2-digit', minute: '2-digit',
   }).replace(/\//g, '-')
@@ -60,7 +70,7 @@ export const formatDateOnly = (date) => {
 export const daysRemaining = (deadline) => {
   if (!deadline) return null
   const now = new Date()
-  const dl = new Date(deadline)
+  const dl = parseDate(deadline)
   const diff = Math.ceil((dl - now) / (1000 * 60 * 60 * 24))
   return diff
 }

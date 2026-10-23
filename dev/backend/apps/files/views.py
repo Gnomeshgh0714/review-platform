@@ -6,6 +6,7 @@
 
 import os
 import logging
+from urllib.parse import quote
 
 from django.conf import settings
 from django.http import FileResponse, Http404, HttpResponse
@@ -135,8 +136,18 @@ class FileViewSet(viewsets.ModelViewSet):
             )
 
         response = FileResponse(file_handle, content_type='application/pdf')
-        # 设置下载文件名（支持中文）
-        response['Content-Disposition'] = f'attachment; filename="{original_name}"'
+        # V1.2 建议#2：Content-Disposition 此前直接拼接客户端原始文件名——
+        # 引号/换行可注入响应头，中文文件名也不符合 RFC 5987。改为：
+        # filename 放 ASCII 安全回退名（去引号/换行），filename* 按
+        # RFC 5987 UTF-8 编码原始名，现代浏览器优先取 filename*
+        safe_ascii = (
+            original_name.encode('ascii', 'ignore').decode('ascii')
+            .replace('"', '').replace('\r', '').replace('\n', '')
+        ) or 'download.pdf'
+        response['Content-Disposition'] = (
+            f'attachment; filename="{safe_ascii}"; '
+            f"filename*=UTF-8''{quote(original_name)}"
+        )
         response['Content-Length'] = str(os.path.getsize(file_path))
         return response
 

@@ -51,30 +51,36 @@ const emit = defineEmits(['read'])
 const list = ref([])
 const loading = ref(true)
 
+// V1.2 建议#11：键位与后端 Notification.Type 枚举对齐
+// （TASK_CREATED/INVITATION/ACCEPT/REJECT/SUBMIT/SUMMARIZE/DECIDE/
+// REMIND/OVERDUE）；此前的 ASSIGN/DECISION/SYSTEM 均非后端枚举值，
+// 导致这些类型恒回退默认铃铛图标
 const getIconName = (type) => {
   const map = {
-    ASSIGN: 'UserFilled',
+    TASK_CREATED: 'Document',
+    INVITATION: 'UserFilled',
     ACCEPT: 'CircleCheck',
     REJECT: 'CircleClose',
     SUBMIT: 'EditPen',
     SUMMARIZE: 'DataAnalysis',
-    DECISION: 'Select',
+    DECIDE: 'Select',
+    REMIND: 'AlarmClock',
     OVERDUE: 'Warning',
-    SYSTEM: 'InfoFilled',
   }
   return map[type] || 'Bell'
 }
 
 const getIconColor = (type) => {
   const map = {
-    ASSIGN: '#409eff',
+    TASK_CREATED: '#409eff',
+    INVITATION: '#409eff',
     ACCEPT: '#67c23a',
     REJECT: '#f56c6c',
     SUBMIT: '#e6a23c',
     SUMMARIZE: '#6f42c1',
-    DECISION: '#20c997',
+    DECIDE: '#20c997',
+    REMIND: '#e6a23c',
     OVERDUE: '#f56c6c',
-    SYSTEM: '#909399',
   }
   return map[type] || '#909399'
 }

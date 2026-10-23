@@ -445,7 +445,9 @@ class SaveDraftApiTests(TestCase):
             {'task_id': self.task.task_id, 'overall_comment': '迟到的草稿'},
             format='json')
         self.assertEqual(resp.status_code, 400)
-        self.assertIn('不可再保存草稿', str(resp.data))
+        # V1.2 建议#16：状态门扩展后文案口径变更（含状态值）
+        self.assertIn('不可保存草稿', str(resp.data))
+        self.assertIn('SUBMITTED', str(resp.data))
 
     def test_draft_still_validates_score_range(self):
         """宽松校验边界：草稿仍校验评分 1-5"""

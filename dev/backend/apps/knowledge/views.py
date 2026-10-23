@@ -12,6 +12,7 @@
 """
 import logging
 
+from django.conf import settings
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.permissions import IsAuthenticated
@@ -217,9 +218,14 @@ class KnowledgeViewSet(viewsets.ViewSet):
 
     @staticmethod
     def _get_client_ip(request):
-        """获取客户端IP"""
+        """获取客户端IP
+
+        V1.2 建议#12：X-Forwarded-For 首段可被客户端任意伪造，
+        仅在 settings.TRUST_X_FORWARDED_FOR=True（确认部署在可信
+        反向代理之后）时才取 XFF，否则以 REMOTE_ADDR 为准
+        """
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
-        if x_forwarded_for:
+        if x_forwarded_for and settings.TRUST_X_FORWARDED_FOR:
             ip = x_forwarded_for.split(',')[0].strip()
         else:
             ip = request.META.get('REMOTE_ADDR')

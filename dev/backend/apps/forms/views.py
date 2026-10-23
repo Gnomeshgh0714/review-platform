@@ -512,10 +512,18 @@ class ReviewOpinionViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_404_NOT_FOUND,
             )
 
-        # 已提交则不可再保存草稿
-        if assignment.assignment_status == 'SUBMITTED':
+        # V1.2 建议#16：草稿状态门此前仅排除 SUBMITTED——回退后被置
+        # EXPIRED/REJECTED 的分配、乃至任务终审 DECIDED 后仍可创建/更新
+        # 草稿（新一轮会重新建分配，旧分配的草稿属死数据）；扩展为：
+        # 已提交/已拒绝/已过期/已超时的分配不可保存，任务已决策后不可保存
+        if assignment.assignment_status in ('SUBMITTED', 'REJECTED', 'EXPIRED', 'OVERDUE'):
             return Response(
-                {'error': '已提交审稿意见，不可再保存草稿'},
+                {'error': f'当前分配状态({assignment.assignment_status})不可保存草稿'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if task.status == 'DECIDED':
+            return Response(
+                {'error': '任务已完成终审决策，不可保存草稿'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
 

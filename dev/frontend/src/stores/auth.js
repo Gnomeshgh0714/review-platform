@@ -1,10 +1,22 @@
 import { defineStore } from 'pinia'
 import { userApi } from '@/api/modules'
 
+// V1.2 建议#17：user_info 损坏（非法 JSON）时不再抛错——此前发生在 store
+// 初始化阶段，会导致整站白屏连登录页都进不去；降级为未登录并清理坏值
+const safeParseUserInfo = (raw) => {
+  if (!raw) return null
+  try {
+    return JSON.parse(raw)
+  } catch {
+    localStorage.removeItem('user_info')
+    return null
+  }
+}
+
 export const useAuthStore = defineStore('auth', {
   state: () => ({
     token: localStorage.getItem('access_token') || '',
-    user: JSON.parse(localStorage.getItem('user_info') || 'null'),
+    user: safeParseUserInfo(localStorage.getItem('user_info')),
   }),
 
   getters: {

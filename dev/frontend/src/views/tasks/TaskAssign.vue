@@ -205,9 +205,11 @@ const subjectOptions = [
 // 默认 14 天后
 const deadline = ref(dayjs().add(14, 'day').format('YYYY-MM-DD'))
 
-// 禁用今天之前的日期
+// V1.2 建议#19：禁选今天之前的日期（今天可选），与 TaskCreate 统一
+// 口径——此前本页规则（Date.now() - 86400000）会放行昨天，且与
+// TaskCreate 的「禁选当天」不一致
 const disabledDate = (date) => {
-  return date.getTime() < Date.now() - 86400000
+  return date.getTime() < new Date().setHours(0, 0, 0, 0)
 }
 
 // ============ 匹配度计算 ============

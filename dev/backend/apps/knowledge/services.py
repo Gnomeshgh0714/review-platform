@@ -104,7 +104,9 @@ class AnonymizationService:
         # 终审决策
         final_decision = task.final_decision or ''
 
-        now = tz.now()
+        # V1.2 建议#7：归档年月用本地时间（tz.now() 取 UTC，月末决策在
+        # 东八区可能落错月份，污染按月检索的口径）
+        now = tz.localtime()
 
         item = KnowledgeItem.objects.create(
             source_task_id=task.task_id,
@@ -439,7 +441,8 @@ class KnowledgeService:
             item.review_notes = notes or ''  # 评审意见 V1.2 严重#5：审核备注落库
             item.save()
 
-        logger.info(f'审核完成: ki={knowledge_id}, decision={decision}, reviewer={reviewer.email}')
+        # V1.2 建议#4：审稿人邮箱属个人信息，日志改记用户 ID
+        logger.info(f'审核完成: ki={knowledge_id}, decision={decision}, reviewer={reviewer.user_id}')
         return item
 
     @classmethod

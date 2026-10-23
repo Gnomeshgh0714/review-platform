@@ -37,6 +37,11 @@ SECRET_KEY = os.environ.get('DJANGO_SECRET_KEY', 'django-insecure-k8$dbc2^z85lqo
 # DEBUG=False，测试不受影响
 DEBUG = os.environ.get('DJANGO_DEBUG', 'False') == 'True'
 
+# V1.2 建议#12：是否信任反向代理传入的 X-Forwarded-For。默认 False——
+# 直连部署时 XFF 首段可被客户端任意伪造（知识库访问审计的 IP 字段会失真）；
+# 仅当确认部署在 Nginx 等可信代理之后时经环境变量开启
+TRUST_X_FORWARDED_FOR = os.environ.get('DJANGO_TRUST_X_FORWARDED_FOR', 'False') == 'True'
+
 ALLOWED_HOSTS = ['localhost', '127.0.0.1', '*']
 
 # Application definition

@@ -105,14 +105,25 @@ class ReviewTaskViewSet(viewsets.ModelViewSet):
         if not reviewer_ids:
             return Response({'error': '请至少选择1位审稿人'}, status=400)
 
+        # V1.2 建议#13：稿件作者本人不可审自己的稿件（双盲与利益冲突
+        # 防线，服务端硬性拦截——前端选择器不应出现作者，但服务端为准）
+        if task.author_user_id and task.author_user_id in reviewer_ids:
+            return Response(
+                {'error': '审稿人列表包含稿件作者本人，请重新选择'},
+                status=400,
+            )
+
         from apps.users.models import User
         reviewers = User.objects.filter(user_id__in=reviewer_ids, roles__contains=['REVIEWER'])
         if len(reviewers) != len(reviewer_ids):
             return Response({'error': '部分用户不存在或非审稿人角色'}, status=400)
 
         # 邀请有效期3天
-        invitation_expiry = timezone.now().date() + timedelta(days=3)
-        task_deadline = deadline_str if deadline_str else (timezone.now().date() + timedelta(days=14))
+        # V1.2 建议#7：业务时区为 Asia/Shanghai，日期计算用 localdate()
+        # （timezone.now().date() 取 UTC 日期，东八区 00:00-08:00 期间会
+        # 比本地日期少一天）
+        invitation_expiry = timezone.localdate() + timedelta(days=3)
+        task_deadline = deadline_str if deadline_str else (timezone.localdate() + timedelta(days=14))
 
         created = []
         with transaction.atomic():
@@ -324,8 +335,14 @@ class ReviewTaskViewSet(viewsets.ModelViewSet):
                     task, request.user, force_summarize=False,
                 )
             StateMachineService.increment_retry_count(task)
+            # V1.2 建议#15：PRD 超时处理第三选项「重新分配新审稿人（截止
+            # 日期≥7天）」经由「回退后重新邀请」达成——回退到 PENDING 后
+            # 分配通道重新可用，文案中向编辑部说明该路径
             return Response({
-                'message': '已回退到待分配，已提交意见保留为历史记录',
+                'message': (
+                    '已回退到待分配，已提交意见保留为历史记录；'
+                    '如需更换审稿人，可重新分配（建议新截止日期不早于 7 天）'
+                ),
                 'marked_expired': marked,
             })
         else:
@@ -428,7 +445,9 @@ class ReviewTaskViewSet(viewsets.ModelViewSet):
             # _mark_overdue 同源）不一致；改按「已接受/审稿中且分配截止日
             # 已过」判定，多分配 join 后去重
             qs = qs.filter(
-                assignments__deadline__lt=timezone.now().date(),
+                # V1.2 建议#7：超时口径同步用本地日期，与 process_scheduled
+                # 的 _mark_overdue 保持同一时区基准
+                assignments__deadline__lt=timezone.localdate(),
                 assignments__assignment_status__in=['ACCEPTED', 'REVIEWING'],
             ).distinct()
 

@@ -37,7 +37,10 @@ class Command(BaseCommand):
             '48小时分配困难通知主编。建议 cron 每日执行一次。')
 
     def handle(self, *args, **options):
-        today = timezone.now().date()
+        # V1.2 建议#7：业务时区为 Asia/Shanghai，用 localdate() 取本地日期
+        # （UTC 日期在东八区 00:00-08:00 期间比本地少一天，会影响邀请
+        # 过期/截止提醒/超时判定的边界）
+        today = timezone.localdate()
         stats = {
             'reminders_sent': 0,
             'invitations_expired': 0,
