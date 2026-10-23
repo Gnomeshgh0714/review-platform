@@ -214,24 +214,48 @@ class KnowledgeSearchBehaviorTests(TestCase):
         self.assertEqual(resp.data['count'], 1)
         self.assertEqual(resp.data['results'][0]['keywords'], ['中高分组'])
 
-    def test_score_range_mid_and_low_are_noop(self):
-        """既有行为：mid/low 未实现过滤逻辑，传参后返回全部 APPROVED 条目"""
+    def test_score_range_mid_and_low_filter(self):
+        """定版裁决 O-2（2026-10-23）：mid/low 两档补齐过滤，与
+        high/mid_high 同用 contains 简化匹配口径（mid=avg 2、low=avg 1）"""
         make_knowledge_item(
             'RT-NM-01', anonymized_dimensions=[{'avg': 4}], keywords=['甲'])
         make_knowledge_item(
             'RT-NM-02', anonymized_dimensions=[{'avg': 3}], keywords=['乙'])
         make_knowledge_item(
+            'RT-NM-04', anonymized_dimensions=[{'avg': 2}], keywords=['丁'])
+        make_knowledge_item(
+            'RT-NM-05', anonymized_dimensions=[{'avg': 1}], keywords=['戊'])
+        make_knowledge_item(
             'RT-NM-03', anonymized_dimensions=[{'dimensionId': 'D1'}],
             keywords=['丙'])
 
-        for param in ('mid', 'low'):
+        # mid：只命中 avg=2 的条目
+        resp = self.client.get(
+            '/api/knowledge/search/', {'score_range': 'mid'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.data['count'], 1,
+            'score_range=mid 应只返回 avg=2 的 1 条',
+        )
+        self.assertEqual(resp.data['results'][0]['keywords'][0], '丁')
+
+        # low：只命中 avg=1 的条目
+        resp = self.client.get(
+            '/api/knowledge/search/', {'score_range': 'low'})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            resp.data['count'], 1,
+            'score_range=low 应只返回 avg=1 的 1 条',
+        )
+        self.assertEqual(resp.data['results'][0]['keywords'][0], '戊')
+
+        # 无 avg 键的条目不受任何档位命中，四档合计不重叠不遗漏
+        for param, expected in (
+            ('high', 1), ('mid_high', 1), ('mid', 1), ('low', 1),
+        ):
             resp = self.client.get(
                 '/api/knowledge/search/', {'score_range': param})
-            self.assertEqual(resp.status_code, 200, f'score_range={param}')
-            self.assertEqual(
-                resp.data['count'], 3,
-                f'score_range={param} 现状为无过滤 no-op，应返回全部 3 条',
-            )
+            self.assertEqual(resp.data['count'], expected, f'score_range={param}')
 
 
 class KnowledgeDetailApiTests(TestCase):
@@ -467,13 +491,13 @@ class KnowledgeReviewAnonymizationApiTests(TestCase):
             {'decision': 'MAYBE'}, format='json')
         self.assertEqual(resp.status_code, 400)
 
-    def test_missing_knowledge_id_returns_400(self):
-        """既有行为：条目不存在时 ValueError 映射为 400（非 404）"""
+    def test_missing_knowledge_id_returns_404(self):
+        """定版裁决 O-3（2026-10-23）：条目不存在时返回 404（对齐 detail 端点惯例）"""
         self.client.force_authenticate(user=self.editor)
         resp = self.client.post(
             '/api/knowledge/KI-20990101-9999/review/',
             {'decision': 'APPROVED'}, format='json')
-        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.status_code, 404)
         self.assertIn('不存在', str(resp.data))
 
     def test_notes_default_empty_string_persisted(self):

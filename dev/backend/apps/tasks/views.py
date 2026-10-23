@@ -380,9 +380,10 @@ class ReviewTaskViewSet(viewsets.ModelViewSet):
             task = StateMachineService.execute_transition(
                 task, 'DECIDED', request.user, f'终审决策: {decision}'
             )
-            # 通知作者
-            if publish:
-                NotificationService.send_decide(task, decision)
+            # 通知作者（定版裁决 O-1，2026-10-23：publish=False 时仍通知终审决策
+            # 结果；send_decide 内部按 publish_opinions_to_author 区分意见公开
+            # 状态文案，不含审稿意见详情）
+            NotificationService.send_decide(task, decision)
             # 知识库自动归档（PRD §5.3.1：DECIDED 后自动触发第一阶段匿名化）
             # 评审意见 V1.2 严重#4：内层 atomic 形成保存点——归档发生数据库级
             # 错误时仅回滚到保存点，外层决策事务照常提交，「失败不阻断」的

@@ -186,7 +186,12 @@ class KnowledgeViewSet(viewsets.ViewSet):
             item = KnowledgeService.review_anonymization(
                 knowledge_id, user, decision, notes
             )
+        except KnowledgeItem.DoesNotExist:
+            # 定版裁决 O-3（2026-10-23）：不存在的条目统一 404，对齐 detail 端点
+            return Response(
+                {'error': f'知识库条目 {knowledge_id} 不存在'}, status=404)
         except ValueError as e:
+            # 状态不允许审核等业务校验错误，保持 400
             return Response({'error': str(e)}, status=400)
 
         return Response(KnowledgeItemSerializer(item).data)

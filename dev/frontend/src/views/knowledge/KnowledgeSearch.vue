@@ -51,6 +51,8 @@
           <el-select v-model="searchParams.score_range" placeholder="评分区间" clearable @change="handleSearch">
             <el-option label="高分（均分≥4）" value="high" />
             <el-option label="中高分（均分≥3）" value="mid_high" />
+            <el-option label="中分（均分≥2）" value="mid" />
+            <el-option label="低分（均分≥1）" value="low" />
           </el-select>
         </el-col>
       </el-row>

@@ -14,10 +14,10 @@
 - 汇总报告   → 所有 EDITOR 用户 SUMMARIZE（作者/审稿人不收）
 - 终审决策   → 作者 DECIDE（编辑部/审稿人不收）
 
-既有行为锁定（断言现状，非缺陷判定）：
-- make_decision publish=False 时不向作者发送 DECIDE 通知
-  （apps/tasks/views.py: `if publish: NotificationService.send_decide(...)`）。
-  若后续产品决定「不公开也通知（只告知结果不公开意见）」，需同步更新断言。
+既有行为锁定（定版裁决 O-1 已变更，2026-10-23）：
+- make_decision publish=False 时仍向作者发送 DECIDE 通知，只告知
+  终审决策结果，不含审稿意见详情（send_decide 内部按
+  publish_opinions_to_author 区分意见公开状态文案）。
 - 编辑部广播（ACCEPT/REJECT/SUBMIT/SUMMARIZE）含执行操作的编辑本人。
 
 服务级补充格子：
@@ -317,8 +317,9 @@ class NotificationMatrixMainChainTests(TestCase):
         self.assertEqual(
             notification_types(self.other_author).count(), 0)
 
-    def test_decide_without_publish_notifies_no_one(self):
-        """现状锁定：publish=False 时作者不收 DECIDE 通知（见文件头注释）"""
+    def test_decide_without_publish_still_notifies_author(self):
+        """定版裁决 O-1（2026-10-23）：publish=False 时作者仍收 DECIDE 通知
+        （只告知决策结果，不含意见详情），编辑部/审稿人不收"""
         task = drive_to_summarized(
             self.client, self.editor_a, self.reviewer_a, self.author,
             self.template)
@@ -326,7 +327,7 @@ class NotificationMatrixMainChainTests(TestCase):
         self.assertEqual(resp.status_code, 200)
 
         self.assertEqual(
-            notification_types(self.author, 'DECIDE').count(), 0)
+            notification_types(self.author, 'DECIDE').count(), 1)
         self.assertEqual(
             notification_types(self.editor_a, 'DECIDE').count(), 0)
         self.assertEqual(

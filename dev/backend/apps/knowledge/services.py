@@ -405,16 +405,20 @@ class KnowledgeService:
         :param decision: APPROVED / REJECTED / PERMANENTLY_EXCLUDED
         :param notes: 审核备注
         :return: KnowledgeItem
-        :raises ValueError: 条目不存在或状态不允许
+        :raises KnowledgeItem.DoesNotExist: 条目不存在（定版裁决 O-3 后由 view 映射 404）
+        :raises ValueError: 状态不允许审核（view 映射 400）
         """
-        # V1.2 一般#9：并发审核（重复点击/双开页面）下 get→校验→save 存在竞态
+        # V1.2 一般#9：并发审核（重复点击/双开页面）下 get→校验→save 存在竞 态
         #（如一方 APPROVED 后另一方仍按 PENDING_REVIEW 通过校验覆写不可逆
         # 归档状态）；整体包事务并对条目行加锁，状态校验移到锁内
+        # 定版裁决 O-3（2026-10-23）：条目不存在改抛 DoesNotExist，
+        # 由 view 层映射 404（对齐 detail 端点惯例）；状态类错误仍走 ValueError→400
         with transaction.atomic():
             try:
                 item = KnowledgeItem.objects.select_for_update().get(knowledge_id=knowledge_id)
             except KnowledgeItem.DoesNotExist:
-                raise ValueError(f'知识库条目 {knowledge_id} 不存在')
+                raise KnowledgeItem.DoesNotExist(
+                    f'知识库条目 {knowledge_id} 不存在')
 
             # 状态校验：只有 PENDING_REVIEW 和 REJECTED 状态可审核
             allowed = [
@@ -499,12 +503,16 @@ class KnowledgeService:
         if recommendation:
             qs = qs.filter(anonymized_recommendations__icontains=recommendation)
 
-        # 评分区间
+        # 评分区间（定版裁决 O-2，2026-10-23：补齐 mid/low 两档，四档全部生效；
+        # 沿用既有 contains 简化匹配口径：high=avg 4 / mid_high=avg 3 /
+        # mid=avg 2 / low=avg 1）
         if score_range:
-            if score_range == 'high':
-                qs = qs.filter(anonymized_dimensions__contains=[{'avg': 4}])  # 简化匹配
-            elif score_range == 'mid_high':
-                qs = qs.filter(anonymized_dimensions__contains=[{'avg': 3}])
+            score_avg_map = {
+                'high': 4, 'mid_high': 3, 'mid': 2, 'low': 1,
+            }
+            avg_value = score_avg_map.get(score_range)
+            if avg_value is not None:
+                qs = qs.filter(anonymized_dimensions__contains=[{'avg': avg_value}])
 
         # 日期范围（按审稿年月）
         if date_start:
