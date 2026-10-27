@@ -7,3 +7,13 @@ djangorestframework-simplejwt>=5.5,<5.6
 django-cors-headers>=4.7,<5.0
 psycopg[binary]>=3.2,<4
 PyMuPDF>=1.26,<2.0
+
+# 生产部署批（#023）：生产 WSGI 伺服（单机同源反代形态的反代上游，
+# 启动命令见 dev/DEPLOY.md）
+gunicorn>=23,<24
+
+# 生产部署批（#023，D-2 机制预留）：REDIS_URL 环境变量配置时启用
+# django-redis 缓存（限流计数共享存储；单实例演示部署可不装可用，
+# 多 worker 部署必设 REDIS_URL，见 settings.py 注释）
+redis>=5,<6
+django-redis>=5.4,<6

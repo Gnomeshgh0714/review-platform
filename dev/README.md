@@ -13,7 +13,7 @@
 | Elasticsearch 8 + IK 分词 | PostgreSQL `icontains` | 单机部署 ES 运维成本高，P0 数据量下 icontains 性能足够 |
 | Redis + Celery 定时任务 | Django 管理命令 + cron | T-19 各定时逻辑全部落在 `process_scheduled` 命令中，见下文 |
 
-通知（T-02）目前仅站内信，邮件通道未接线（`.env.example` 中 `CELERY_*` 均为未接线占位）。
+通知（T-02）为站内信 + 邮件双通道（#023 路线A）：邮件经同步 SMTP 发送，默认 console 后端（打印到后端日志），生产 SMTP 经环境变量整组切换（`EMAIL_*`，见 `.env.example` 与 `DEPLOY.md`）；`CELERY_*` 仍为未接线占位。
 
 ## 目录结构
 
@@ -97,7 +97,7 @@ cron 接法（示例：每 30 分钟一次）：
 
 ```bash
 cd backend
-python manage.py test apps    # 184 项单元/并发测试（含 AC-T-14 三人并发提交；#018 时点口径）
+python manage.py test apps    # 单元/并发测试（#018 时点 184 项基线；#023 邮件与 env 回落批后 192 项，只增不减）
 ```
 
 全链路冒烟（需后端已启动、演示账号已就位）：`python scripts/e2e_smoke.py`，
@@ -109,8 +109,8 @@ python manage.py test apps    # 184 项单元/并发测试（含 AC-T-14 三人�
 
 ## 已知限制与待办
 
-- T-02 邮件通知未接线；Celery/Redis 未部署（定时任务走管理命令 + cron）
+- T-02 邮件走同步 SMTP（#023 路线A），默认 console 后端，生产 SMTP 配置见 `DEPLOY.md`；Celery 未部署（定时任务走管理命令 + cron），Redis 缓存为可选预留（多 worker 部署需设 `REDIS_URL`，见 settings.py 注释）
 - 前端暂无用户管理界面（后端 `POST /api/users/` 已可用，仅编辑部权限）
-- AI 审稿（`apps/forms/ai_review.py`）为同步调用，LLM 超时 180s 会阻塞请求；需 `REVIEWER_LLM_API_KEY` 环境变量，未配置时接口报错但平台其余功能不受影响
+- AI 审稿（`apps/forms/ai_review.py`）为同步调用，LLM 超时 120s 会阻塞请求；需 `REVIEWER_LLM_API_KEY` 环境变量，未配置时接口报错但平台其余功能不受影响（#023 勘误：代码真实值 120s，此处原写 180s 系历史口径误记）
 - 前端构建产物 index chunk >1MB（gzip 后 405KB），后续可做 manualChunks 拆分
 - 业务 ID 采用「日期前缀 + 当日序号」生成（如 `RO-20261012-0001`），高并发下 `ReviewOpinion` 已用 savepoint+重试兜底，其余模型沿用计数式生成，如遇并发冲突可参照 `ReviewOpinion.save` 的写法

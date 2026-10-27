@@ -4,6 +4,7 @@ from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework_simplejwt.tokens import RefreshToken
 from django.contrib.auth import authenticate
+from apps.notifications.email import send_notification_email
 from .models import User
 from .serializers import (
     UserSerializer, UserCreateSerializer, UserAdminSerializer,
@@ -73,6 +74,19 @@ class UserViewSet(viewsets.ModelViewSet):
         serializer = self.get_serializer(data=request.data)
         serializer.is_valid(raise_exception=True)
         user = serializer.save()
+        # T-02 第二触点（#023 路线A）：PRD §6.2.1 要求编辑部创建账号后系统
+        # 发送邀请邮件；初始密码按现有实现口径随邮件告知本人（编辑部显式
+        # 传入的明文或缺省 changeme123，serializer 层已密文落库，此处仅取
+        # 请求原文用于告知；现有实现 help_text 亦明示首次登录后修改）。
+        # 发送失败或收件人无邮箱均不阻断账号创建（封装内吞异常，返回 201）
+        send_notification_email(user, 'ACCOUNT_INVITATION', {
+            'user_name': user.name,
+            'email': user.email,
+            'initial_password': (
+                request.data.get('password')
+                or UserCreateSerializer.DEFAULT_INITIAL_PASSWORD
+            ),
+        })
         return Response(UserSerializer(user).data, status=status.HTTP_201_CREATED)
 
     def update(self, request, *args, **kwargs):

@@ -1,13 +1,16 @@
 """
 通知服务模块 - 对应PRD §3.1.10 notifications
 
-P0阶段：仅创建站内Notification记录，不发送邮件。
+T-02（生产部署批 #023，路线A）：站内信 + 邮件双通道。站内 Notification
+为主通道，邮件经 apps/notifications/email.py 同步补发（模板按类型集中
+定义）；邮件失败或收件人无邮箱均不阻断站内信。
 所有方法均为静态方法，供业务层调用。
 """
 import logging
 
 from django.db import transaction
 
+from apps.notifications.email import send_notification_email
 from apps.notifications.models import Notification
 from apps.users.models import User
 from apps.tasks.models import ReviewTask, ReviewAssignment
@@ -49,17 +52,26 @@ class NotificationService:
                     content=content,
                     is_read=False,
                 )
-            logger.info(
-                '通知已创建: user=%s, type=%s, task=%s, title=%s',
-                user.user_id, ntype, task.task_id if task else None, title,
-            )
-            return notification
         except Exception as e:
             logger.error(
                 '创建通知失败: user=%s, type=%s, error=%s',
                 getattr(user, 'user_id', None), ntype, str(e),
             )
             raise
+        logger.info(
+            '通知已创建: user=%s, type=%s, task=%s, title=%s',
+            user.user_id, ntype, task.task_id if task else None, title,
+        )
+        # T-02 邮件通道（#023 路线A）：站内信落库成功后同路径补发邮件——
+        # 10 个业务方法（含 _notify_multiple 批量路径）均经此覆盖；
+        # 邮件失败或收件人无邮箱只记日志，绝不阻断站内信，容错口径与
+        # _notify_multiple 吞单条失败一致；模板见 apps/notifications/email.py
+        send_notification_email(user, ntype, {
+            'title': title,
+            'content': content,
+            'task_title': task.title if task else '',
+        })
+        return notification
 
     @staticmethod
     def _notify_multiple(users, task, ntype, title, content):

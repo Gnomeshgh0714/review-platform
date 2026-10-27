@@ -77,6 +77,12 @@ class UserAdminSerializer(serializers.ModelSerializer):
 
 class UserCreateSerializer(serializers.ModelSerializer):
     """创建用户序列化器（编辑部创建审稿人/作者账号）"""
+
+    # 缺省初始密码：编辑部未显式传密码时使用。创建成功后随邀请邮件告知
+    # 本人（PRD §6.2.1，接线见 apps/users/views.py 的 create），首次登录后
+    # 应尽快修改；提为常量供邮件路径引用同一口径，避免双头维护
+    DEFAULT_INITIAL_PASSWORD = 'changeme123'
+
     password = serializers.CharField(
         write_only=True, required=False,
         style={'input_type': 'password'},
@@ -105,7 +111,7 @@ class UserCreateSerializer(serializers.ModelSerializer):
         # 未传密码时设默认密码，保证账号可登录
         password = validated_data.pop('password', None)
         user = User(**validated_data)
-        user.set_password(password or 'changeme123')
+        user.set_password(password or self.DEFAULT_INITIAL_PASSWORD)
         user.is_active = True
         user.save()
         return user
