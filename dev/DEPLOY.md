@@ -46,10 +46,12 @@ cp backend/.env.example backend/.env
 | DJANGO_SECURE_PROXY_SSL_HEADER | 必填 | `HTTP_X_FORWARDED_PROTO,https`（反代 TLS 终止，后端才能感知 https） |
 | DJANGO_TRUST_X_FORWARDED_FOR | 必填 | `True`（部署在可信反代之后，知识库访问审计取真实 IP） |
 | REVIEWER_LLM_API_KEY | 按需 | 不配则 AI 审稿报错，平台其余功能不受影响 |
+| REVIEWER_LLM_MODEL | 可选 | AI 审稿模型名，默认 glm-latest，见 .env.example |
 | EMAIL_BACKEND / EMAIL_HOST / EMAIL_PORT / EMAIL_HOST_USER / EMAIL_HOST_PASSWORD / EMAIL_USE_TLS / DEFAULT_FROM_EMAIL | 生产必填组 | T-02 通知邮件走 SMTP；不配则邮件只打印到后端日志（console 后端），站内信不受影响 |
 | REDIS_URL | 可选 | 多 worker 部署必设（限流计数共享）；单 worker 演示可不设 |
 | THROTTLE_LOGIN_MINUTE / THROTTLE_LOGIN_DAILY | 可选 | 默认 10/min、50/day |
 | CORS_ALLOWED_ORIGINS | 可选 | 同源反代形态前后端同域名，不跨域，可不配；有独立域名的前端客户端时才需要 |
+| BOOTSTRAP_PASSWORD | 可选 | bootstrap_dev 创建演示账号的密码，默认 Demo@2026；仅初始化演示数据时用（第 5 步），自建初始数据可不配 |
 
 ### 3. migrate（token_blacklist 两表必须建）
 

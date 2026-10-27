@@ -86,7 +86,8 @@ class UserCreateSerializer(serializers.ModelSerializer):
     password = serializers.CharField(
         write_only=True, required=False,
         style={'input_type': 'password'},
-        help_text='可选，缺省为 changeme123（首次登录后应尽快修改）',
+        # 引用同常量拼入提示文本，常量变更时 help_text 不漂移（核验建议项）
+        help_text=f'可选，缺省为 {DEFAULT_INITIAL_PASSWORD}（首次登录后应尽快修改）',
     )
 
     class Meta:
