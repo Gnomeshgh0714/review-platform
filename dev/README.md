@@ -107,12 +107,12 @@ python manage.py test apps    # 单元/并发测试（#018 时点 184 项基线�
 加 `--frontend` 可先做经前端构建产物的冒烟（决策 #014 挂账项）：自动 `npx vite build`
 产出 dist 后起本地静态服务，断言入口 HTML 及其引用的 JS/CSS 资源可达（5 项），再跑上述 API 全链路（固定项合计 29 项）。
 
-前端单元测试：`cd frontend && npm run test`（Vitest + happy-dom，20 项，覆盖 api 层 401 刷新重放/silent404 拦截器/登出并发 401 toast 去重（#018）、OpinionView 角色分流、UserManage 角色门（#024）与 ReviewForm AI 审稿异步轮询（#026））。
+前端单元测试：`cd frontend && npm run test`（Vitest + happy-dom，23 项，覆盖 api 层 401 刷新重放/silent404 拦截器/登出并发 401 toast 去重（#018）、OpinionView 角色分流、UserManage 角色门（#024）与 ReviewForm AI 审稿异步轮询（#026））。
 
 ## 已知限制与待办
 
 - T-02 邮件走同步 SMTP（#023 路线A），默认 console 后端，生产 SMTP 配置见 `DEPLOY.md`；Celery 未部署（定时任务走管理命令 + cron），Redis 缓存为可选预留（多 worker 部署需设 `REDIS_URL`，见 settings.py 注释）
 - ~~前端暂无用户管理界面~~ 已落地（#024）：`/users` 页面（仅 EDITOR，搜索/新建/编辑/删除/分页），后端 `POST /api/users/` 自 #012 起可用
-- AI 审稿已异步化（#026，F-3）：`POST /api/forms/ai_review/` 创建任务后提交后台线程池秒回（201，返回 job_id），前端每 3s 轮询 `GET /api/forms/ai_review_status/` 取结果；仍需 `REVIEWER_LLM_API_KEY` 环境变量，未配置时任务置 FAILED（error 落库，页面可见原因），平台其余功能不受影响；卡在中间态的任务由 `process_scheduled` 每日清扫（超 5 分钟置 FAILED）
+- AI 审稿已异步化（#026，F-3）：`POST /api/forms/ai_review/` 创建任务后提交后台线程池秒回（201，返回 job_id），前端每 3s 轮询 `GET /api/forms/ai_review_status/` 取结果；仍需 `REVIEWER_LLM_API_KEY` 环境变量，未配置时任务置 FAILED（error 落库，页面可见原因），平台其余功能不受影响；卡在中间态的任务由 `process_scheduled` 每 30 分钟清扫（超 5 分钟置 FAILED）
 - ~~前端构建产物 index chunk >1MB~~ 已拆包（#026，F-4）：vite manualChunks 按依赖族拆 vendor（echarts/element/vue/utils），index 业务 chunk 降至 40.67KB（gzip 15.59KB）；vendor-element 约 1MB 为全量引入 ElementPlus+图标的既定代价，图标按需引入留独立小批
 - 业务 ID 采用「日期前缀 + 当日序号」生成（如 `RO-20261012-0001`），高并发下 `ReviewOpinion` 已用 savepoint+重试兜底，其余模型沿用计数式生成，如遇并发冲突可参照 `ReviewOpinion.save` 的写法
