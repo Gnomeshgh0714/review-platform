@@ -7,6 +7,11 @@ export const userApi = {
   getMe: () => api.get('/users/me/'),
   updateProfile: (data) => api.put('/users/update_profile/', data),
   getReviewers: (params) => api.get('/users/reviewers/', { params }),
+  // 用户管理（编辑部专用，#024）：对应 UserViewSet create/update/partial_update/destroy；
+  // 编辑部重置密码（update 传 password）会拉黑该用户全部 refresh token
+  create: (data) => api.post('/users/', data),
+  update: (id, data) => api.patch(`/users/${id}/`, data),
+  remove: (id) => api.delete(`/users/${id}/`),
 }
 
 // ============ 任务模块 ============

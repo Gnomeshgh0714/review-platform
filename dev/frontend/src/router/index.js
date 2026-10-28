@@ -121,6 +121,13 @@ const routes = [
         component: () => import('@/views/templates/TemplateList.vue'),
         meta: { title: '模板管理', icon: 'Files', roles: ['EDITOR'] },
       },
+      // 用户管理（#024：后端 UserViewSet 五端点仅编辑部，F-2 前端落地）
+      {
+        path: 'users',
+        name: 'UserManage',
+        component: () => import('@/views/users/UserManage.vue'),
+        meta: { title: '用户管理', icon: 'User', roles: ['EDITOR'] },
+      },
       // 个人中心
       {
         path: 'profile',

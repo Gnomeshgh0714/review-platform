@@ -111,6 +111,8 @@ const allMenus = [
   { path: '/knowledge', title: '知识库检索', icon: 'Search', roles: ['EDITOR', 'REVIEWER'] },
   { path: '/knowledge/review', title: '匿名化审核', icon: 'CircleCheck', roles: ['EDITOR'] },
   { path: '/templates', title: '模板管理', icon: 'Files', roles: ['EDITOR'] },
+  // #024 用户管理：icon 用 UserFilled 避免与个人中心（User）重复
+  { path: '/users', title: '用户管理', icon: 'UserFilled', roles: ['EDITOR'] },
   { path: '/profile', title: '个人中心', icon: 'User', roles: ['EDITOR', 'REVIEWER', 'AUTHOR'] },
 ]
 
