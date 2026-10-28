@@ -24,7 +24,7 @@ from apps.tasks.state_machine import StateMachineService, StateMachineError
 from apps.notifications.services import NotificationService
 from apps.users.models import User
 
-from .models import ReviewForm, ReviewOpinion
+from .models import AIReviewJob, ReviewForm, ReviewOpinion
 from .serializers import (
     ReviewFormSerializer,
     ReviewOpinionSerializer,
@@ -131,23 +131,22 @@ class ReviewFormViewSet(viewsets.GenericViewSet):
     @action(detail=False, methods=['post'])
     def ai_review(self, request):
         """
-        POST AI 辅助审稿 - 自动生成审稿意见草稿
+        POST AI 辅助审稿 - 提交异步任务自动生成审稿意见草稿（决策 #026，F-3）
 
-        调用 LLM（reviewer agent）自动分析稿件 PDF，生成四维评分+评语+推荐意见。
+        调用 LLM（reviewer agent）自动分析稿件，生成四维评分+评语+推荐意见，
         审稿人可在 AI 结果基础上修改后提交。
+
+        原同步链路（请求线程内直接调 generate_review 阻塞最长 120s）改后台
+        线程执行：本校验链（权限门+分配校验）原样保留，尾部改为创建
+        AIReviewJob 后提交线程池秒回，前端轮询 ai_review_status 取结果。
 
         Request body:
             - task_id: 任务ID（必填）
 
-        Returns:
-            - dimension_scores: [{dimensionId, score, comment}, ...]
-            - recommendation: ACCEPT/MINOR_REVISION/MAJOR_REVISION/REJECT
-            - overall_comment: 综合评语
-            - suggestions: [str, ...]
+        Returns（201，异步受理口径）:
+            - job_id: AIR-YYYYMMDD-NNNN 任务ID
+            - status: PENDING/RUNNING（终态经 ai_review_status 查询）
         """
-        import logging
-        logger = logging.getLogger(__name__)
-
         user = request.user
         if not user.is_reviewer:
             return Response(
@@ -185,33 +184,65 @@ class ReviewFormViewSet(viewsets.GenericViewSet):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        # 调用 AI 审稿服务
-        try:
-            from .ai_review import AIReviewService
-            result = AIReviewService.generate_review(task)
-            logger.info(
-                'AI 审稿完成: task=%s, reviewer=%s, recommendation=%s',
-                task.task_id, user.user_id, result.get('recommendation'),
-            )
-            return Response(result, status=status.HTTP_200_OK)
+        # 创建异步任务并提交线程池（秒回；LLM 调用移入后台线程）。
+        # 原同步链路的 FileNotFoundError/ValueError 异常不再在请求内处理，
+        # 一律由工作线程写入 job.error，前端从状态端点读取
+        from .ai_jobs import submit_ai_review_job
+        job = AIReviewJob.objects.create(task=task, reviewer=user)
+        submit_ai_review_job(job)
+        logger.info(
+            'AI 审稿任务已提交: job=%s, task=%s, reviewer=%s',
+            job.job_id, task.task_id, user.user_id,
+        )
+        return Response(
+            {'job_id': job.job_id, 'status': job.status},
+            status=status.HTTP_201_CREATED,
+        )
 
-        except FileNotFoundError as e:
+    @action(detail=False, methods=['get'])
+    def ai_review_status(self, request):
+        """
+        GET 查询 AI 审稿任务状态（决策 #026，配套 ai_review 轮询）
+
+        仅任务提交人本人可查（他人 job 一律 403，含编辑部——防越权枚举
+        job_id 读他人审稿结果）。
+
+        Query params:
+            - job_id: 任务ID（必填，AIR-YYYYMMDD-NNNN）
+
+        Returns:
+            - job_id / status / result / error / created_at / finished_at
+              （result 仅 SUCCEEDED 时非空，结构与原同步响应一致）
+        """
+        job_id = request.query_params.get('job_id')
+        if not job_id:
             return Response(
-                {'error': f'稿件文件不存在: {str(e)}'},
+                {'error': '缺少参数 job_id'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        try:
+            job = AIReviewJob.objects.get(job_id=job_id)
+        except AIReviewJob.DoesNotExist:
+            return Response(
+                {'error': '任务不存在'},
                 status=status.HTTP_404_NOT_FOUND,
             )
-        except ValueError as e:
-            logger.error('AI 审稿失败: task=%s, error=%s', task.task_id, str(e))
+
+        if job.reviewer_id != request.user.user_id:
             return Response(
-                {'error': f'AI 审稿失败: {str(e)}'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                {'error': '无权查询他人的 AI 审稿任务'},
+                status=status.HTTP_403_FORBIDDEN,
             )
-        except Exception as e:
-            logger.error('AI 审稿异常: task=%s, error=%s', task.task_id, str(e))
-            return Response(
-                {'error': f'AI 审稿服务异常，请稍后重试'},
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            )
+
+        return Response({
+            'job_id': job.job_id,
+            'status': job.status,
+            'result': job.result,
+            'error': job.error,
+            'created_at': job.created_at,
+            'finished_at': job.finished_at,
+        })
 
     @action(detail=False, methods=['post'])
     def validate_references(self, request):

@@ -7,6 +7,8 @@
 
 额外路径：
 - forms/get_form/         ：GET 获取审稿表单（?task_id=xxx）
+- forms/ai_review/        ：POST 提交 AI 审稿异步任务（决策 #026，返回 job_id）
+- forms/ai_review_status/ ：GET 轮询 AI 审稿任务状态（?job_id=xxx，仅本人）
 - opinions/submit/        ：POST 提交审稿意见
 - opinions/save_draft/    ：POST 保存草稿
 - opinions/my_opinion/    ：GET 获取当前审稿人的意见（?task_id=xxx）
@@ -28,6 +30,8 @@ urlpatterns = [
          name='form-get-form'),
     path('forms/ai_review/', ReviewFormViewSet.as_view({'post': 'ai_review'}),
          name='form-ai-review'),
+    path('forms/ai_review_status/', ReviewFormViewSet.as_view({'get': 'ai_review_status'}),
+         name='form-ai-review-status'),
     path('forms/validate_references/', ReviewFormViewSet.as_view({'post': 'validate_references'}),
          name='form-validate-references'),
     # 审稿意见操作

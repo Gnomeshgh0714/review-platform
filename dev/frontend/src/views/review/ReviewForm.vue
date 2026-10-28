@@ -42,6 +42,15 @@
             {{ aiDone ? '已生成' : 'AI 生成审稿意见' }}
           </el-button>
         </div>
+        <!-- 决策 #026（F-3）：异步轮询期间展示等待文案（可离开页面，组件卸载停止轮询） -->
+        <el-alert
+          v-if="aiLoading"
+          type="info"
+          :closable="false"
+          show-icon
+          class="mt-8"
+          title="AI 审稿进行中（约 1-2 分钟），可离开本页稍后回来"
+        />
         <el-alert v-if="aiError" type="error" :title="aiError" :closable="true" show-icon class="mt-8" />
         <el-alert v-if="aiDone" type="success" title="AI 审稿意见已生成，请检查并修改后提交" :closable="false" show-icon class="mt-8" />
       </el-card>
@@ -226,6 +235,8 @@ const formData = reactive({
 
 let autoSaveTimer = null
 let hasChanges = false
+// 决策 #026（F-3）：AI 审稿轮询定时器（3s 间隔，组件卸载时与 autoSaveTimer 同口径清理）
+let aiPollTimer = null
 
 const recommendationTag = computed(() => {
   return RECOMMENDATION[formData.recommendation] || { label: '-', type: 'info' }
@@ -343,47 +354,74 @@ const confirmSubmit = async () => {
   }
 }
 
-// AI 辅助审稿
+// AI 辅助审稿（决策 #026，F-3：异步提交 + 3s 轮询）
+// 填充逻辑与原同步链路完全一致（维度评分/推荐/评语/建议）
+const applyAIResult = (result) => {
+  // 自动填充维度评分和评语
+  if (result.dimension_scores) {
+    for (const ds of result.dimension_scores) {
+      const dimId = ds.dimensionId || ds.dimension_id
+      formData.scores[dimId] = ds.score
+      formData.comments[dimId] = ds.comment || ''
+    }
+  }
+
+  // 填充推荐意见
+  if (result.recommendation) {
+    formData.recommendation = result.recommendation
+  }
+
+  // 填充综合评语
+  if (result.overall_comment) {
+    formData.overall_comment = result.overall_comment
+  }
+
+  // 填充修改建议
+  if (result.suggestions && result.suggestions.length) {
+    formData.suggestions = Array.isArray(result.suggestions)
+      ? result.suggestions.join('\n')
+      : result.suggestions
+  }
+}
+
+const stopAIPolling = () => {
+  if (aiPollTimer) {
+    clearInterval(aiPollTimer)
+    aiPollTimer = null
+  }
+}
+
 const handleAIReview = async () => {
   aiLoading.value = true
   aiError.value = ''
   try {
-    const result = await formApi.aiReview(taskId)
+    // 提交异步任务（秒回 {job_id, status}），不再同步等待 LLM（最长 120s）
+    const { job_id: jobId } = await formApi.aiReview(taskId)
 
-    // 自动填充维度评分和评语
-    if (result.dimension_scores) {
-      for (const ds of result.dimension_scores) {
-        const dimId = ds.dimensionId || ds.dimension_id
-        formData.scores[dimId] = ds.score
-        formData.comments[dimId] = ds.comment || ''
-      }
-    }
-
-    // 填充推荐意见
-    if (result.recommendation) {
-      formData.recommendation = result.recommendation
-    }
-
-    // 填充综合评语
-    if (result.overall_comment) {
-      formData.overall_comment = result.overall_comment
-    }
-
-    // 填充修改建议
-    if (result.suggestions && result.suggestions.length) {
-      formData.suggestions = Array.isArray(result.suggestions)
-        ? result.suggestions.join('\n')
-        : result.suggestions
-    }
-
-    aiDone.value = true
-    hasChanges = true
-    ElMessage.success('AI 审稿意见已生成，请检查并修改')
+    // 每 3s 轮询任务状态，SUCCEEDED 填充表单 / FAILED 展示错误；
+    // PENDING/RUNNING 继续等待。轮询请求瞬时失败不终止任务，下一轮重试
+    aiPollTimer = setInterval(async () => {
+      try {
+        const job = await formApi.aiReviewStatus(jobId)
+        if (job.status === 'SUCCEEDED') {
+          stopAIPolling()
+          applyAIResult(job.result || {})
+          aiDone.value = true
+          hasChanges = true
+          aiLoading.value = false
+          ElMessage.success('AI 审稿意见已生成，请检查并修改')
+        } else if (job.status === 'FAILED') {
+          stopAIPolling()
+          aiError.value = job.error || 'AI 审稿任务失败'
+          aiLoading.value = false
+          ElMessage.error('AI 审稿失败，请手动填写或稍后重试')
+        }
+      } catch (e) { /* 瞬时失败：下轮重试 */ }
+    }, 3000)
   } catch (e) {
-    aiError.value = e.response?.data?.error || e.message || 'AI 审稿调用失败'
-    ElMessage.error('AI 审稿失败，请手动填写或稍后重试')
-  } finally {
+    aiError.value = e.response?.data?.error || e.message || 'AI 审稿任务提交失败'
     aiLoading.value = false
+    ElMessage.error('AI 审稿任务提交失败，请稍后重试')
   }
 }
 
@@ -440,6 +478,8 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (autoSaveTimer) clearInterval(autoSaveTimer)
+  // AI 审稿轮询与自动保存同口径清理（离开页面即停止轮询）
+  stopAIPolling()
   window.removeEventListener('beforeunload', beforeUnloadHandler)
 })
 </script>

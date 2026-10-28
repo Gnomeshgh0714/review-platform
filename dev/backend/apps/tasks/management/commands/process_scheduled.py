@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from apps.notifications.models import Notification
 from apps.notifications.services import NotificationService
+from apps.forms.models import AIReviewJob
 from apps.tasks.models import ReviewTask, ReviewAssignment
 from apps.tasks.state_machine import StateMachineService
 
@@ -30,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 REMIND_DAYS_BEFORE = (7, 3, 1)  # 截止前第 7/3/1 天提醒
 NOTIFY_EDITOR_INTERVAL = timedelta(hours=48)  # S-02: 分配困难 48 小时未处理再通知
+AI_JOB_STALE_MINUTES = 5  # 决策 #026：AI 审稿任务超过 5 分钟未到终态即清扫
 
 
 class Command(BaseCommand):
@@ -48,12 +50,14 @@ class Command(BaseCommand):
             'assignments_overdue': 0,
             'tasks_awaiting_editor': 0,
             'chief_notified': 0,
+            'ai_jobs_swept': 0,
         }
 
         self._expire_invitations(today, stats)
         self._send_deadline_reminders(today, stats)
         self._mark_overdue(today, stats)
         self._notify_editor_in_chief(stats)
+        self._sweep_stale_ai_jobs(stats)
 
         self.stdout.write(self.style.SUCCESS(
             'T-19 定时任务完成：'
@@ -62,7 +66,8 @@ class Command(BaseCommand):
             f'任务回退 {stats["tasks_rolled_back"]} 个 | '
             f'审稿超时 {stats["assignments_overdue"]} 条 | '
             f'待编辑部处理通知 {stats["tasks_awaiting_editor"]} 个 | '
-            f'通知主编 {stats["chief_notified"]} 个'
+            f'通知主编 {stats["chief_notified"]} 个 | '
+            f'AI 审稿任务清扫 {stats["ai_jobs_swept"]} 条'
         ))
 
     # ------------------------------------------------------------------
@@ -206,3 +211,29 @@ class Command(BaseCommand):
                 message=f'该任务已重试 {task.retry_count} 次，超过 48 小时无人处理，系统自动提醒。',
             )
             stats['chief_notified'] += 1
+
+    # ------------------------------------------------------------------
+    # 5. AI 审稿任务超时清扫（决策 #026，F-3 异步化配套兜底）
+    # ------------------------------------------------------------------
+    def _sweep_stale_ai_jobs(self, stats):
+        """PENDING/RUNNING 超过 5 分钟的 AI 审稿任务置 FAILED。
+
+        正常链路 LLM 调用 timeout=120s，5 分钟仍未终态说明工作线程异常死亡
+        或进程重启中断了任务（线程池随进程消亡，job 永远停在中间态）。
+        复用本命令的既有 cron 调度，不新增部署条目。
+        """
+        cutoff = timezone.now() - timedelta(minutes=AI_JOB_STALE_MINUTES)
+        stale = AIReviewJob.objects.filter(
+            status__in=['PENDING', 'RUNNING'],
+            created_at__lt=cutoff,
+        )
+        for job in stale:
+            job.status = 'FAILED'
+            job.error = '任务超时清扫'
+            job.finished_at = timezone.now()
+            job.save(update_fields=['status', 'error', 'finished_at', 'updated_at'])
+            stats['ai_jobs_swept'] += 1
+            logger.warning(
+                'AI 审稿任务超时清扫: job=%s, task=%s, created_at=%s',
+                job.job_id, job.task_id, job.created_at,
+            )

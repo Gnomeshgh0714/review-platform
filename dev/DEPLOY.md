@@ -96,7 +96,7 @@ cd ../backend
     --workers 1
 ```
 
-- 演示环境用 `--workers 1` 可不配 REDIS_URL（限流计数 locmem 进程内有效）。
+- 演示环境用 `--workers 1` 可不配 REDIS_URL（限流计数 locmem 进程内有效）；建议加 `--threads 4`（AI 审稿异步任务跑在 gunicorn 进程的后台线程内，多线程保证审稿任务与常规请求不互相排队）。
 - `--workers 2` 及以上必须配 REDIS_URL，否则各进程独立计数会稀释登录限流的效果。
 - 建议交给 systemd 等进程托管（`Restart=always`），不要裸 nohup 跑。
 
@@ -175,5 +175,5 @@ T-19 定时逻辑与 token 黑名单清理各一条：
 ## 已知边界（部署前知悉）
 
 - 登录限流按 IP 计数，多 worker 部署必须配 REDIS_URL（见第 7 步）。
-- AI 审稿为同步调用，LLM 超时 120s 会占住一个 gunicorn worker，小 worker 数下避免多人同时触发（README「已知限制」节同源口径）。
+- AI 审稿已异步化（#026）：LLM 调用跑在进程内后台线程池（max_workers=2），不再占住请求 worker；同时进行的审稿任务最多 2 个，第三个排队；进程重启会丢失未完成任务，停留中间态的任务由 `process_scheduled` cron 每日清扫置 FAILED（README「已知限制」节同源口径）。
 - 单机形态无负载均衡与多实例故障转移，适合演示与小团队使用；用户量上来后再评估拆分。

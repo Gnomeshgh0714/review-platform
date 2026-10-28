@@ -63,7 +63,11 @@ export const fileApi = {
 // ============ 审稿表单模块 ============
 export const formApi = {
   getForm: (taskId) => api.get('/forms/get_form/', { params: { task_id: taskId } }),
-  aiReview: (taskId) => api.post('/forms/ai_review/', { task_id: taskId }, { timeout: 180000 }),
+  // 决策 #026（F-3）：AI 审稿异步化——提交秒回 {job_id, status}，
+  // 原同步 180s 超时配置随阻塞链路一并移除（提交不再等待 LLM）
+  aiReview: (taskId) => api.post('/forms/ai_review/', { task_id: taskId }),
+  // 轮询 AI 审稿任务状态（仅本人 job 可查，他人 403）
+  aiReviewStatus: (jobId) => api.get('/forms/ai_review_status/', { params: { job_id: jobId } }),
   validateReferences: (taskId) => api.post('/forms/validate_references/', { task_id: taskId }, { timeout: 300000 }),
   submitOpinion: (data) => api.post('/opinions/submit/', data),
   saveDraft: (data) => api.post('/opinions/save_draft/', data),

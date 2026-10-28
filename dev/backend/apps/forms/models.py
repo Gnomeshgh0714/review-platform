@@ -5,6 +5,69 @@ from apps.tasks.models import ReviewTask, ReviewAssignment, Template
 from apps.users.models import User
 
 
+class AIReviewJob(models.Model):
+    """AI 审稿异步任务（决策 #026，F-3）
+
+    POST /api/forms/ai_review/ 不再同步等待 LLM（最长 120s 阻塞请求线程），
+    改为创建本表记录 + 后台线程执行（apps/forms/ai_jobs.py，不引入 Celery
+    ——#011/#023 两次排除的项目既定路线），前端轮询
+    GET /api/forms/ai_review_status/?job_id= 取状态与结果。
+    """
+
+    class Status(models.TextChoices):
+        PENDING = 'PENDING', '排队中'
+        RUNNING = 'RUNNING', '进行中'
+        SUCCEEDED = 'SUCCEEDED', '已完成'
+        FAILED = 'FAILED', '已失败'
+
+    job_id = models.CharField(max_length=64, primary_key=True, editable=False)
+    task = models.ForeignKey(ReviewTask, on_delete=models.CASCADE,
+                             related_name='ai_review_jobs', verbose_name='关联任务')
+    reviewer = models.ForeignKey(User, on_delete=models.CASCADE,
+                                 related_name='ai_review_jobs', verbose_name='提交审稿人')
+    status = models.CharField('状态', max_length=20,
+                              choices=Status.choices, default=Status.PENDING)
+    # 成功后写入 generate_review 的返回结构（dimension_scores/recommendation/
+    # overall_comment/suggestions），失败为 null
+    result = models.JSONField('审稿结果', null=True, blank=True)
+    error = models.TextField('失败原因', blank=True, default='')
+    created_at = models.DateTimeField('创建时间', auto_now_add=True)
+    updated_at = models.DateTimeField('更新时间', auto_now=True)
+    finished_at = models.DateTimeField('完成时间', null=True, blank=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['status']),
+            models.Index(fields=['reviewer']),
+        ]
+
+    def save(self, *args, **kwargs):
+        """保存 AI 审稿任务。
+
+        job_id（AIR-YYYYMMDD-NNNN）与 ReviewOpinion/ReviewForm 同为「当日计数」
+        生成，并发下撞主键的处理同 ReviewOpinion.save：保存点包裹插入、
+        冲突回滚到保存点后重新计数重试，重试耗尽按最新计数重算一次直写。
+        """
+        if not self.job_id:
+            today = tz.now().strftime('%Y%m%d')
+            for _ in range(6):
+                count = AIReviewJob.objects.filter(
+                    job_id__startswith=f'AIR-{today}'
+                ).count()
+                self.job_id = f'AIR-{today}-{count + 1:04d}'
+                try:
+                    with transaction.atomic():
+                        super().save(*args, **kwargs)
+                    return
+                except IntegrityError:
+                    continue  # 他方已提交同号主键：重新计数再试
+            count = AIReviewJob.objects.filter(
+                job_id__startswith=f'AIR-{today}'
+            ).count()
+            self.job_id = f'AIR-{today}-{count + 1:04d}'
+        super().save(*args, **kwargs)
+
+
 class ReviewForm(models.Model):
     """审稿表单 - 对应PRD §6.2.4 ReviewForm实体"""
 
